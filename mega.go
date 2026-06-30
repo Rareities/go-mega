@@ -1918,8 +1918,9 @@ func (m *Mega) Delete(node *Node, destroy bool) error {
 		return err
 	}
 
-	parent := m.FS.lookup[node.hash]
-	parent.removeChild(node)
+	if node.parent != nil {
+		node.parent.removeChild(node)
+	}
 	delete(m.FS.lookup, node.hash)
 
 	return nil

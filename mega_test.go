@@ -240,6 +240,10 @@ func TestDelete(t *testing.T) {
 	}
 	session.FS.mutex.Unlock()
 
+	session.FS.mutex.Lock()
+	parent := node.parent
+	session.FS.mutex.Unlock()
+
 	retry(t, "Hard delete", func() error {
 		return session.Delete(node, true)
 	})
@@ -249,6 +253,11 @@ func TestDelete(t *testing.T) {
 	session.FS.mutex.Lock()
 	if _, ok := session.FS.lookup[node.hash]; ok {
 		t.Error("Expects file to be disappeared")
+	}
+	for _, child := range parent.children {
+		if child == node {
+			t.Error("Expects file to be removed from its parent's children")
+		}
 	}
 	session.FS.mutex.Unlock()
 }
