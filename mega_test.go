@@ -442,3 +442,43 @@ func TestWaitEvents(t *testing.T) {
 	// Check nothing happens if we fire the event with no listeners
 	m.waitEventsFire()
 }
+
+// TestProcessDeleteNode checks that a delete event which is part of a
+// move (m set) keeps the node in the lookup map so its identity is
+// preserved when the following add node event re-attaches it, while a
+// plain delete event removes the node completely.
+func TestProcessDeleteNode(t *testing.T) {
+	m := New()
+	root := &Node{fs: m.FS, name: "root", hash: "ROOT", ntype: ROOT}
+	child := &Node{fs: m.FS, name: "file", hash: "X", parent: root, ntype: FILE}
+	root.addChild(child)
+	m.FS.lookup["ROOT"] = root
+	m.FS.lookup["X"] = child
+
+	// A move delete event should detach the node from its parent but
+	// keep it in the lookup map.
+	err := m.processDeleteNode([]byte(`{"a":"d","n":"X","m":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(root.children) != 0 {
+		t.Errorf("node not removed from parent on move delete")
+	}
+	if m.FS.lookup["X"] != child {
+		t.Errorf("node identity not preserved in lookup on move delete")
+	}
+
+	// A plain delete event should remove the node from both the
+	// parent and the lookup map.
+	root.addChild(child)
+	err = m.processDeleteNode([]byte(`{"a":"d","n":"X"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(root.children) != 0 {
+		t.Errorf("node not removed from parent on delete")
+	}
+	if _, found := m.FS.lookup["X"]; found {
+		t.Errorf("node not removed from lookup on delete")
+	}
+}
