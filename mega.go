@@ -2,10 +2,13 @@ package mega
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha512"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +16,12 @@ import (
 	"log"
 	"math/big"
 	mrand "math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,6 +81,9 @@ func (c *config) SetRetries(r int) {
 
 // Set concurrent download workers
 func (c *config) SetDownloadWorkers(w int) error {
+	if w <= 0 {
+		return EWORKER_COUNT_INVALID
+	}
 	if w <= MAX_DOWNLOAD_WORKERS {
 		c.dl_workers = w
 		return nil
@@ -90,6 +99,9 @@ func (c *config) SetTimeOut(t time.Duration) {
 
 // Set concurrent upload workers
 func (c *config) SetUploadWorkers(w int) error {
+	if w <= 0 {
+		return EWORKER_COUNT_INVALID
+	}
 	if w <= MAX_UPLOAD_WORKERS {
 		c.ul_workers = w
 		return nil
@@ -126,12 +138,100 @@ type Mega struct {
 	// Loggers
 	logf   func(format string, v ...any)
 	debugf func(format string, v ...any)
-	// serialize the API requests
-	apiMu sync.Mutex
+	// apiMu protects lazy initialization of apiGate. The gate itself is
+	// context-aware so callers waiting behind another API request can cancel.
+	apiMu   sync.Mutex
+	apiGate chan struct{}
+	// pollEvents has a session lifetime independent from individual operations.
+	eventMu     sync.Mutex
+	eventCancel context.CancelFunc
+	eventDone   chan struct{}
 	// mutex to protext waitEvents
 	waitEventsMu sync.Mutex
 	// Outstanding channels to close to indicate events all received
 	waitEvents []chan struct{}
+}
+
+func contextOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Mega) acquireAPIGate(ctx context.Context) (func(), error) {
+	m.apiMu.Lock()
+	if m.apiGate == nil {
+		m.apiGate = make(chan struct{}, 1)
+	}
+	gate := m.apiGate
+	m.apiMu.Unlock()
+
+	select {
+	case gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate
+			return nil, err
+		}
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Close stops this client's session-scoped event poller. It does not close
+// the caller-owned HTTP client and is safe to call more than once.
+func (m *Mega) Close() error {
+	m.eventMu.Lock()
+	defer m.eventMu.Unlock()
+	m.stopEventPollerLocked()
+	return nil
+}
+
+// stopEventPollerLocked cancels and joins the session poller. eventMu must be
+// held by the caller; pollEvents never acquires it.
+func (m *Mega) stopEventPollerLocked() {
+	if m.eventCancel != nil {
+		m.eventCancel()
+	}
+	if m.eventDone != nil {
+		<-m.eventDone
+	}
+	m.eventCancel = nil
+	m.eventDone = nil
+}
+
+func (m *Mega) startEventPoller() {
+	m.eventMu.Lock()
+	defer m.eventMu.Unlock()
+	m.stopEventPollerLocked()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.eventCancel = cancel
+	done := make(chan struct{})
+	m.eventDone = done
+	go func() {
+		defer close(done)
+		m.pollEvents(ctx)
+	}()
 }
 
 // Filesystem node types
@@ -384,9 +484,19 @@ func (m *Mega) GetMasterKey() []byte {
 // "Login" using the session ID (for API auth) and master key (for decryption). Alternative to logging in with username/password
 // This can be used to import back a session exported with GetSessionID and GetMasterKey without requiring the password again
 func (m *Mega) LoginWithKeys(sessionId string, masterKey []byte) error {
+	return m.LoginWithKeysContext(context.Background(), sessionId, masterKey)
+}
+
+// LoginWithKeysContext restores a saved session using the supplied context.
+func (m *Mega) LoginWithKeysContext(ctx context.Context, sessionId string, masterKey []byte) error {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_ = m.Close()
 	m.sid = sessionId
 	m.k = masterKey
-	return m.postAuthInit()
+	return m.postAuthInitContext(ctx)
 }
 
 // SetLogger sets the logger for important messages.  By default this
@@ -421,139 +531,937 @@ func backOffSleep(pt *time.Duration) {
 	}
 }
 
+func advanceBackoff(pt *time.Duration) {
+	*pt *= 2
+	if *pt > maxSleepTime {
+		*pt = maxSleepTime
+	}
+}
+
+// apiAction returns the action code only for a single-command API request.
+func apiAction(request []byte) string {
+	var commands []struct {
+		Action string `json:"a"`
+	}
+	if err := json.Unmarshal(request, &commands); err != nil || len(commands) != 1 {
+		return ""
+	}
+	return commands[0].Action
+}
+
+// apiRequestedPutNodeType extracts the type requested by the pinned p callers.
+// Upload.Finish and CreateDir each submit one node with its requested type in n[0].t.
+func apiRequestedPutNodeType(request []byte) (int, bool) {
+	var commands []struct {
+		Action string `json:"a"`
+		Nodes  []struct {
+			Type json.RawMessage `json:"t"`
+		} `json:"n"`
+	}
+	if err := json.Unmarshal(request, &commands); err != nil || len(commands) != 1 || commands[0].Action != "p" || len(commands[0].Nodes) != 1 {
+		return 0, false
+	}
+	typeCode, valid := decodeAPIErrorCode(commands[0].Nodes[0].Type)
+	if !valid || (typeCode != FILE && typeCode != FOLDER) {
+		return 0, false
+	}
+	return int(typeCode), true
+}
+
+// isRetryableAPIAction is an explicit allowlist of read-only API actions.
+func isRetryableAPIAction(action string) bool {
+	switch action {
+	case "us0", "ug", "uq", "f", "g":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRetryableAPIStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func isTLSAPIError(err error) bool {
+	var verificationErr *tls.CertificateVerificationError
+	var recordHeaderErr tls.RecordHeaderError
+	var alertErr tls.AlertError
+	var unknownAuthorityErr x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidCertErr x509.CertificateInvalidError
+	if errors.As(err, &verificationErr) || errors.As(err, &recordHeaderErr) ||
+		errors.As(err, &alertErr) || errors.As(err, &unknownAuthorityErr) ||
+		errors.As(err, &hostnameErr) || errors.As(err, &invalidCertErr) {
+		return true
+	}
+	// Some TLS alerts are surfaced by net/http as plain errors rather than
+	// exported TLS error types. Fail closed for those diagnostics as well.
+	return strings.Contains(strings.ToLower(err.Error()), "tls:")
+}
+
+func isRetryableAPITransportError(err error) bool {
+	// The public request API has no caller context. If the HTTP stack reports
+	// cancellation/deadline anyway, fail immediately; otherwise retry only
+	// errors with an explicit transient network classification (or truncation).
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isTLSAPIError(err) {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
+}
+
+// parseBoundedRetryAfter distinguishes an absent/invalid header (use normal
+// backoff) from a valid server delay that exceeds this client's sleep bound
+// (do not retry early against the server's instruction).
+func parseBoundedRetryAfter(value string, now time.Time) (delay time.Duration, present, withinBound bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false, true
+	}
+	// RFC delta-seconds is a non-negative decimal integer. Treat an integer
+	// overflow as an over-bound server delay, not as a malformed/absent header
+	// that would permit an earlier retry.
+	deltaSeconds := true
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			deltaSeconds = false
+			break
+		}
+	}
+	if deltaSeconds {
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > int64(maxSleepTime/time.Second) {
+			return 0, true, false
+		}
+		delay = time.Duration(seconds) * time.Second
+		return delay, true, true
+	}
+	date, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false, true
+	}
+	delay = date.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true, delay <= maxSleepTime
+}
+
+func closeAPIResponse(resp *http.Response) {
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+}
+
+func decodeAPIErrorCode(raw json.RawMessage) (ErrorMsg, bool) {
+	data := bytes.TrimSpace(raw)
+	if len(data) == 0 || bytes.Equal(data, []byte("-0")) || (data[0] != '-' && (data[0] < '0' || data[0] > '9')) {
+		return 0, false
+	}
+
+	var value int64
+	if err := json.Unmarshal(data, &value); err != nil {
+		return 0, false
+	}
+	code := int(value)
+	if int64(code) != value {
+		return 0, false
+	}
+	return ErrorMsg(code), true
+}
+
+func apiObjectErrorCode(raw json.RawMessage) (ErrorMsg, bool, error) {
+	data := bytes.TrimSpace(raw)
+	if len(data) == 0 || data[0] != '{' {
+		return 0, false, nil
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return 0, false, EBADRESP
+	}
+	rawCode, found := fields["err"]
+	if !found {
+		return 0, false, nil
+	}
+	code, valid := decodeAPIErrorCode(rawCode)
+	if !valid {
+		return 0, true, EBADRESP
+	}
+	return code, true, nil
+}
+
+func apiDeleteResponseError(response []json.RawMessage) error {
+	if len(response) != 1 {
+		return EBADRESP
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response[0], &fields); err != nil || fields == nil {
+		return EBADRESP
+	}
+	rawResults, found := fields["r"]
+	if !found {
+		return EBADRESP
+	}
+	rawResults = bytes.TrimSpace(rawResults)
+	if len(rawResults) == 0 || rawResults[0] != '[' {
+		return EBADRESP
+	}
+	var results []json.RawMessage
+	if err := json.Unmarshal(rawResults, &results); err != nil {
+		return EBADRESP
+	}
+	if len(results) == 0 {
+		// Evidence: https://github.com/meganz/sdk/blob/master/src/commands.cpp#L1594-L1631
+		// CommandDelNode::procresult starts e as API_OK and only overwrites it
+		// when a numeric r entry exists. This is current SDK evidence, not a
+		// contract established by the pinned Go source.
+		return nil
+	}
+	if len(results) != 1 {
+		return EBADRESP
+	}
+	code, valid := decodeAPIErrorCode(results[0])
+	if !valid {
+		return EBADRESP
+	}
+	return parseError(code)
+}
+
+func apiUploadURLResponseError(response []json.RawMessage) error {
+	if len(response) != 1 {
+		return EBADRESP
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response[0], &fields); err != nil || fields == nil {
+		return EBADRESP
+	}
+	rawURL, found := fields["p"]
+	if !found {
+		return EBADRESP
+	}
+	var target string
+	if err := json.Unmarshal(rawURL, &target); err != nil || target == "" {
+		return EBADRESP
+	}
+	parsedURL, err := url.Parse(target)
+	if err != nil || !parsedURL.IsAbs() || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return EBADRESP
+	}
+	return nil
+}
+
+func apiLoginResponseError(response []json.RawMessage) error {
+	if len(response) != 1 {
+		return EBADRESP
+	}
+
+	var result LoginResp
+	if err := json.Unmarshal(response[0], &result); err != nil {
+		return EBADRESP
+	}
+	if result.Csid == "" || result.Privk == "" || result.Key == "" {
+		return EBADRESP
+	}
+	return nil
+}
+
+func apiLinkResponseError(response []json.RawMessage) error {
+	if len(response) != 1 {
+		return EBADRESP
+	}
+	var link string
+	if err := json.Unmarshal(response[0], &link); err != nil || link == "" {
+		return EBADRESP
+	}
+	return nil
+}
+
+// apiPutNodesResponseError validates the first node consumed by Upload.Finish
+// and CreateDir. Their addFSNode path needs h, p, u, t, a, and k. Additional
+// returned nodes are accepted, and the first node's t must match the request's
+// n[0].t. No broader server-side node schema is asserted here.
+func apiPutNodesResponseError(response []json.RawMessage, requestedType int) error {
+	if len(response) != 1 {
+		return EBADRESP
+	}
+	if requestedType != FILE && requestedType != FOLDER {
+		return EBADRESP
+	}
+	var result UploadCompleteResp
+	if err := json.Unmarshal(response[0], &result); err != nil || len(result.F) == 0 {
+		return EBADRESP
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response[0], &fields); err != nil || fields == nil {
+		return EBADRESP
+	}
+	rawNodes, found := fields["f"]
+	if !found {
+		return EBADRESP
+	}
+	rawNodes = bytes.TrimSpace(rawNodes)
+	if len(rawNodes) == 0 || rawNodes[0] != '[' {
+		return EBADRESP
+	}
+	var nodes []json.RawMessage
+	if err := json.Unmarshal(rawNodes, &nodes); err != nil || len(nodes) == 0 {
+		return EBADRESP
+	}
+	firstNode := bytes.TrimSpace(nodes[0])
+	if len(firstNode) == 0 || firstNode[0] != '{' {
+		return EBADRESP
+	}
+	var nodeFields map[string]json.RawMessage
+	if err := json.Unmarshal(firstNode, &nodeFields); err != nil {
+		return EBADRESP
+	}
+	node := result.F[0]
+	if node.Hash == "" || node.Parent == "" || node.User == "" || node.Attr == "" || node.Key == "" || !strings.Contains(node.Key, ":") {
+		return EBADRESP
+	}
+	typeCode, valid := decodeAPIErrorCode(nodeFields["t"])
+	if !valid || int(typeCode) != requestedType {
+		return EBADRESP
+	}
+	return nil
+}
+
+func apiResponseError(action string, request, buf []byte) error {
+	data := bytes.TrimSpace(buf)
+	if len(data) == 0 || !json.Valid(data) {
+		return EBADRESP
+	}
+
+	if data[0] == '-' {
+		code, valid := decodeAPIErrorCode(data)
+		if !valid {
+			return EBADRESP
+		}
+		return parseError(code)
+	}
+	if data[0] != '[' {
+		return EBADRESP
+	}
+
+	var response []json.RawMessage
+	if err := json.Unmarshal(data, &response); err != nil || len(response) == 0 {
+		return EBADRESP
+	}
+	if len(response) == 1 {
+		if code, valid := decodeAPIErrorCode(response[0]); valid {
+			if code == 0 && action != "m" && action != "a" && action != "d" {
+				return EBADRESP
+			}
+			return parseError(code)
+		}
+		if code, found, err := apiObjectErrorCode(response[0]); err != nil {
+			return err
+		} else if found {
+			if code == 0 {
+				switch action {
+				case "d":
+					return apiDeleteResponseError(response)
+				case "p":
+					requestedType, valid := apiRequestedPutNodeType(request)
+					if !valid {
+						return EBADRESP
+					}
+					return apiPutNodesResponseError(response, requestedType)
+				case "u":
+					return apiUploadURLResponseError(response)
+				case "us":
+					return apiLoginResponseError(response)
+				case "l":
+					return EBADRESP
+				default:
+					return EBADRESP
+				}
+			}
+			return parseError(code)
+		}
+		if bytes.Equal(bytes.TrimSpace(response[0]), []byte("null")) {
+			return EBADRESP
+		}
+	}
+
+	switch action {
+	case "m", "a":
+		// The pinned source's known numeric API_OK response is exactly [0].
+		// No other success shape is assumed for these response-ignoring actions.
+		return EBADRESP
+	case "d":
+		return apiDeleteResponseError(response)
+	case "p":
+		requestedType, valid := apiRequestedPutNodeType(request)
+		if !valid {
+			return EBADRESP
+		}
+		return apiPutNodesResponseError(response, requestedType)
+	case "u":
+		return apiUploadURLResponseError(response)
+	case "us":
+		return apiLoginResponseError(response)
+	case "l":
+		return apiLinkResponseError(response)
+	case "us0", "ug", "uq", "f", "g":
+		return apiReadResponseError(action, response)
+	default:
+		return EBADRESP
+	}
+}
+
+func apiRequiredString(fields map[string]json.RawMessage, name string) (string, bool) {
+	raw, ok := fields[name]
+	if !ok {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || value == "" {
+		return "", false
+	}
+	return value, true
+}
+
+func apiRequiredInt64(fields map[string]json.RawMessage, name string) (int64, bool) {
+	raw, ok := fields[name]
+	if !ok {
+		return 0, false
+	}
+	var value int64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func apiRequiredUint64(fields map[string]json.RawMessage, name string) (uint64, bool) {
+	raw, ok := fields[name]
+	if !ok {
+		return 0, false
+	}
+	var value uint64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func apiFilesystemNodeError(raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return EBADRESP
+	}
+	var node FSNode
+	if err := json.Unmarshal(raw, &node); err != nil {
+		return EBADRESP
+	}
+	if _, ok := apiRequiredString(fields, "h"); !ok {
+		return EBADRESP
+	}
+	typeCode, valid := decodeAPIErrorCode(fields["t"])
+	if !valid {
+		return EBADRESP
+	}
+	node.T = int(typeCode)
+	switch node.T {
+	case ROOT, INBOX, TRASH:
+		return nil
+	case FILE, FOLDER:
+	default:
+		return EBADRESP
+	}
+	if _, ok := apiRequiredString(fields, "u"); !ok {
+		return EBADRESP
+	}
+	if _, ok := apiRequiredString(fields, "a"); !ok {
+		return EBADRESP
+	}
+	key, ok := apiRequiredString(fields, "k")
+	if !ok {
+		return EBADRESP
+	}
+	keyUser, itemKey, found := strings.Cut(key, ":")
+	if !found || keyUser == "" || itemKey == "" {
+		return EBADRESP
+	}
+	if _, ok := apiRequiredInt64(fields, "ts"); !ok {
+		return EBADRESP
+	}
+	if node.T == FILE {
+		size, ok := apiRequiredInt64(fields, "s")
+		if !ok || size < 0 {
+			return EBADRESP
+		}
+	}
+	sharedUser, userPresent := fields["su"]
+	sharedKey, keyPresent := fields["sk"]
+	if userPresent != keyPresent {
+		return EBADRESP
+	}
+	sharedRoot := false
+	if userPresent {
+		var user, shareKey string
+		if json.Unmarshal(sharedUser, &user) != nil || json.Unmarshal(sharedKey, &shareKey) != nil || user == "" || shareKey == "" {
+			return EBADRESP
+		}
+		sharedRoot = node.T == FOLDER
+	}
+	// Shared roots can be top-level and therefore have no parent handle. Keep
+	// accepting that shape, which addFSNode represents as a separate shared
+	// root, while rejecting an absent/empty parent on ordinary files/folders.
+	if rawParent, present := fields["p"]; present {
+		var parent string
+		if json.Unmarshal(rawParent, &parent) != nil || (parent == "" && !sharedRoot) {
+			return EBADRESP
+		}
+	} else if !sharedRoot {
+		return EBADRESP
+	}
+	return nil
+}
+
+func apiFilesResponseError(raw json.RawMessage, fields map[string]json.RawMessage) error {
+	rawNodes, found := fields["f"]
+	if !found {
+		return EBADRESP
+	}
+	rawNodes = bytes.TrimSpace(rawNodes)
+	if len(rawNodes) == 0 || rawNodes[0] != '[' {
+		return EBADRESP
+	}
+	var nodes []json.RawMessage
+	if err := json.Unmarshal(rawNodes, &nodes); err != nil {
+		return EBADRESP
+	}
+	for _, node := range nodes {
+		if err := apiFilesystemNodeError(node); err != nil {
+			return err
+		}
+	}
+	if _, ok := apiRequiredString(fields, "sn"); !ok {
+		return EBADRESP
+	}
+	// "ok" contains optional shared-folder keys; if present, each entry must
+	// be complete because getFileSystem installs these keys before its nodes.
+	if rawKeys, present := fields["ok"]; present {
+		rawKeys = bytes.TrimSpace(rawKeys)
+		if len(rawKeys) == 0 || rawKeys[0] != '[' {
+			return EBADRESP
+		}
+		var keys []json.RawMessage
+		if err := json.Unmarshal(rawKeys, &keys); err != nil {
+			return EBADRESP
+		}
+		for _, rawKey := range keys {
+			var keyFields map[string]json.RawMessage
+			if err := json.Unmarshal(rawKey, &keyFields); err != nil || keyFields == nil {
+				return EBADRESP
+			}
+			if _, ok := apiRequiredString(keyFields, "h"); !ok {
+				return EBADRESP
+			}
+			if _, ok := apiRequiredString(keyFields, "k"); !ok {
+				return EBADRESP
+			}
+		}
+	}
+	var result FilesResp
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return EBADRESP
+	}
+	return nil
+}
+
+// apiReadResponseError validates the fields consumed by each pinned read
+// callsite, without asserting unrelated or evolving response fields.
+func apiReadResponseError(action string, response []json.RawMessage) error {
+	if len(response) != 1 {
+		return EBADRESP
+	}
+	object := bytes.TrimSpace(response[0])
+	if len(object) == 0 || object[0] != '{' {
+		return EBADRESP
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(object, &fields); err != nil || fields == nil {
+		return EBADRESP
+	}
+	switch action {
+	case "us0":
+		version, valid := decodeAPIErrorCode(fields["v"])
+		if !valid || version <= 0 {
+			return EBADRESP
+		}
+		if version == 2 {
+			if _, ok := apiRequiredString(fields, "s"); !ok {
+				return EBADRESP
+			}
+		}
+		return nil
+	case "ug":
+		var result UserResp
+		if err := json.Unmarshal(object, &result); err != nil {
+			return EBADRESP
+		}
+		if _, ok := apiRequiredString(fields, "u"); !ok {
+			return EBADRESP
+		}
+		return nil
+	case "uq":
+		var result QuotaResp
+		if err := json.Unmarshal(object, &result); err != nil {
+			return EBADRESP
+		}
+		if _, ok := apiRequiredUint64(fields, "mstrg"); !ok {
+			return EBADRESP
+		}
+		if _, ok := apiRequiredUint64(fields, "cstrg"); !ok {
+			return EBADRESP
+		}
+		return nil
+	case "f":
+		return apiFilesResponseError(response[0], fields)
+	case "g":
+		var result DownloadResp
+		if err := json.Unmarshal(object, &result); err != nil {
+			return EBADRESP
+		}
+		if rawErr, present := fields["e"]; present {
+			code, valid := decodeAPIErrorCode(rawErr)
+			if !valid {
+				return EBADRESP
+			}
+			if code != 0 {
+				return parseError(code)
+			}
+		}
+		target, ok := apiRequiredString(fields, "g")
+		if !ok {
+			return EBADRESP
+		}
+		if _, ok := apiRequiredString(fields, "at"); !ok {
+			return EBADRESP
+		}
+		if _, ok := apiRequiredUint64(fields, "s"); !ok {
+			return EBADRESP
+		}
+		parsedURL, err := url.Parse(target)
+		if err != nil || !parsedURL.IsAbs() || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+			return EBADRESP
+		}
+		return nil
+	default:
+		return EBADRESP
+	}
+}
+
+func uncertainOutcomeError(action string, err error) error {
+	return &UncertainOutcomeError{Action: action, Err: err}
+}
+
+func apiStatusError(resp *http.Response, sid string) error {
+	return &HTTPStatusError{StatusCode: resp.StatusCode, Status: redactSessionID(resp.Status, sid)}
+}
+
+func (m *Mega) doAPIRequest(req *http.Request, retryable bool) (*http.Response, error) {
+	if retryable {
+		return m.client.Do(req)
+	}
+
+	// Prevent net/http from replaying a POST while following a redirect.
+	client := *m.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client.Do(req)
+}
+
 // API request method
-func (m *Mega) api_request(r []byte) (buf []byte, err error) {
-	var resp *http.Response
-	// serialize the API requests
-	m.apiMu.Lock()
+func (m *Mega) api_request(r []byte) ([]byte, error) {
+	return m.api_request_context(context.Background(), r)
+}
+
+// api_request_context is the context-aware form of api_request.
+func (m *Mega) api_request_context(ctx context.Context, r []byte) ([]byte, error) {
+	return m.apiRequestWithHashCashContext(ctx, r, solveHashCashChallengeContext)
+}
+
+// apiRequestWithHashCash keeps the request path testable with a deterministic
+// solver while production uses solveHashCashChallenge through api_request.
+func (m *Mega) apiRequestWithHashCash(r []byte, solveHashCash func(string, int, time.Duration, int) (string, error)) (body []byte, retErr error) {
+	return m.apiRequestWithHashCashContext(context.Background(), r, func(_ context.Context, token string, easiness int, timeout time.Duration, workers int) (string, error) {
+		return solveHashCash(token, easiness, timeout, workers)
+	})
+}
+
+func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solveHashCash func(context.Context, string, int, time.Duration, int) (string, error)) (body []byte, retErr error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	action := apiAction(r)
+	retryable := isRetryableAPIAction(action)
+	attempts := 1
+	if retryable && m.retries > 0 {
+		attempts += m.retries
+	}
+
+	// Serialize API requests without making queued callers wait unconditionally.
+	release, err := m.acquireAPIGate(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer func() {
 		m.sn++
-		m.apiMu.Unlock()
+		release()
 	}()
 
 	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
-
 	if m.sid != "" {
 		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
 	}
-
-	sleepTime := minSleepTime // initial backoff time
-	for i := 0; i < m.retries+1; i++ {
-		if i != 0 {
-			m.debugf("Retry API request %d/%d: %v", i, m.retries, err)
-			backOffSleep(&sleepTime)
-		}
-
-		// Create request
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(r))
-		if err != nil {
-			continue
-		}
-		addRequestHeaders(req)
-
-		// Send request
-		resp, err = m.client.Do(req)
-		if err != nil {
-			continue
-		}
-
-		// Handle 402 Payment Required status with hashcash challenge
-		if resp.StatusCode == 402 {
-			sleepTime = minSleepTime // reset exp backoff time
-			hashCashHeader := resp.Header.Get("X-Hashcash")
-			if hashCashHeader == "" {
-				_ = resp.Body.Close()
-				continue
-			}
-
-			// Parse hashcash header
-			easiness, token, valid := parseHashcash(hashCashHeader)
-			if !valid {
-				_ = resp.Body.Close()
-				continue
-			}
-
-			// Close the current response before making a new request
-			_ = resp.Body.Close()
-
-			// Generate hashcash response
-			cashValue, err := solveHashCashChallenge(token, easiness, HASHCASH_CHALLENGE_TIMEOUT, halfCPUCores())
-			if err != nil {
-				m.debugf("Failed to solve hashcash challenge: %v", err)
-				continue
-			}
-			if cashValue == "" {
-				m.debugf("Failed to solve hashcash challenge: empty cash value")
-				continue
-			}
-
-			// Create a new request with the hashcash header
-			req, err = http.NewRequest("POST", url, bytes.NewBuffer(r))
-			if err != nil {
-				continue
-			}
-			addHashCashRequestHeaders(req, token, cashValue)
-			// Send the new request
-			resp, err = m.client.Do(req)
-			if err != nil {
-				continue
-			}
-
-			// If still getting 402, give up this attempt and retry
-			if resp.StatusCode == 402 {
-				_ = resp.Body.Close()
-				continue
-			}
-		}
-
-		if resp.StatusCode != 200 {
-			// err must be not-nil on a continue
-			_ = resp.Body.Close()
-			continue
-		}
-
-		buf, err = io.ReadAll(resp.Body)
-		if err != nil {
-			_ = resp.Body.Close()
-			continue
-		}
-		err = resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		// at this point the body is read and closed
-
-		if !bytes.HasPrefix(buf, []byte("[")) && !bytes.HasPrefix(buf, []byte("-")) {
-			return nil, EBADRESP
-		}
-
-		if len(buf) < 6 {
-			var emsg [1]ErrorMsg
-			err = json.Unmarshal(buf, &emsg)
-			if err != nil {
-				err = json.Unmarshal(buf, &emsg[0])
-			}
-			if err != nil {
-				return buf, EBADRESP
-			}
-			err = parseError(emsg[0])
-			if err == EAGAIN {
-				continue
-			}
-			return buf, err
-		}
-
-		if err == nil {
-			return buf, nil
-		}
+	defer func() {
+		retErr = sanitizeAPIError(retErr, m.sid)
+	}()
+	uncertain := func(err error) error {
+		return uncertainOutcomeError(action, sanitizeAPIError(err, m.sid))
 	}
 
-	return nil, err
+	sleepTime := minSleepTime // initial backoff time
+	var lastErr error
+	var retryDelay time.Duration
+	var retryDelaySet bool
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			if !retryable && lastErr != nil {
+				return nil, uncertain(err)
+			}
+			return nil, err
+		}
+		if i != 0 {
+			m.debugf("Retry API request %d/%d: %v", i, attempts-1, sanitizeAPIError(lastErr, m.sid))
+			if retryDelaySet {
+				if err := sleepContext(ctx, retryDelay); err != nil {
+					return nil, err
+				}
+				retryDelaySet = false
+				sleepTime *= 2
+				if sleepTime > maxSleepTime {
+					sleepTime = maxSleepTime
+				}
+			} else {
+				if err := sleepContext(ctx, sleepTime); err != nil {
+					return nil, err
+				}
+				sleepTime *= 2
+				if sleepTime > maxSleepTime {
+					sleepTime = maxSleepTime
+				}
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(r))
+		if err != nil {
+			return nil, err
+		}
+		addRequestHeaders(req)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		resp, err := m.doAPIRequest(req, retryable)
+		if err != nil {
+			closeAPIResponse(resp)
+			lastErr = err
+			if !retryable {
+				return nil, uncertain(err)
+			}
+			if !isRetryableAPITransportError(err) {
+				return nil, err
+			}
+			continue
+		}
+		if resp == nil {
+			lastErr = errors.New("HTTP client returned a nil response")
+			if !retryable {
+				return nil, uncertain(lastErr)
+			}
+			return nil, lastErr
+		}
+
+		// A valid challenge is an explicit protocol continuation, including for
+		// non-read actions. Without established rejection semantics, an unusable
+		// challenge leaves a non-read request's outcome uncertain.
+		if resp.StatusCode == http.StatusPaymentRequired {
+			challengeErr := apiStatusError(resp, m.sid)
+			sleepTime = minSleepTime
+			easiness, token, valid := parseHashcash(resp.Header.Get("X-Hashcash"))
+			closeAPIResponse(resp)
+			if !valid {
+				lastErr = challengeErr
+				if !retryable {
+					return nil, uncertain(challengeErr)
+				}
+				return nil, challengeErr
+			}
+
+			cashValue, solveErr := solveHashCash(ctx, token, easiness, HASHCASH_CHALLENGE_TIMEOUT, halfCPUCores())
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if !retryable {
+					return nil, uncertain(ctxErr)
+				}
+				return nil, ctxErr
+			}
+			if solveErr != nil || cashValue == "" {
+				if solveErr != nil {
+					m.debugf("Failed to solve hashcash challenge: %v", sanitizeAPIError(solveErr, m.sid))
+				} else {
+					m.debugf("Failed to solve hashcash challenge: empty cash value")
+				}
+				failureErr := challengeErr
+				if solveErr != nil {
+					failureErr = errors.Join(challengeErr, solveErr)
+				} else if cashValue == "" {
+					failureErr = errors.Join(challengeErr, errors.New("hashcash solver returned an empty solution"))
+				}
+				lastErr = failureErr
+				failureErr = sanitizeAPIError(failureErr, m.sid)
+				if !retryable {
+					return nil, uncertain(failureErr)
+				}
+				return nil, failureErr
+			}
+
+			req, err = http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(r))
+			if err != nil {
+				return nil, err
+			}
+			addHashCashRequestHeaders(req, token, cashValue)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			resp, err = m.doAPIRequest(req, retryable)
+			if err != nil {
+				closeAPIResponse(resp)
+				lastErr = err
+				if !retryable {
+					return nil, uncertain(err)
+				}
+				if !isRetryableAPITransportError(err) {
+					return nil, err
+				}
+				continue
+			}
+			if resp == nil {
+				lastErr = errors.New("HTTP client returned a nil response")
+				if !retryable {
+					return nil, uncertain(lastErr)
+				}
+				return nil, lastErr
+			}
+			if resp.StatusCode == http.StatusPaymentRequired {
+				statusErr := apiStatusError(resp, m.sid)
+				closeAPIResponse(resp)
+				if !retryable {
+					return nil, uncertain(statusErr)
+				}
+				return nil, statusErr
+			}
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			statusErr := apiStatusError(resp, m.sid)
+			closeAPIResponse(resp)
+			if !retryable {
+				return nil, uncertain(statusErr)
+			}
+			lastErr = statusErr
+			if !isRetryableAPIStatus(resp.StatusCode) {
+				return nil, statusErr
+			}
+			delay, present, withinBound := parseBoundedRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+			if present && !withinBound {
+				return nil, statusErr
+			}
+			if present && delay > 0 {
+				retryDelay = delay
+				retryDelaySet = true
+			}
+			continue
+		}
+		if resp.Body == nil {
+			lastErr = fmt.Errorf("%w: response body is nil", EBADRESP)
+			if !retryable {
+				return nil, uncertain(lastErr)
+			}
+			return nil, lastErr
+		}
+
+		buf, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			if !retryable {
+				return nil, uncertain(readErr)
+			}
+			if isRetryableAPITransportError(readErr) {
+				continue
+			}
+			return nil, readErr
+		}
+		if closeErr != nil {
+			lastErr = closeErr
+			if !retryable {
+				return nil, uncertain(closeErr)
+			}
+			if isRetryableAPITransportError(closeErr) {
+				continue
+			}
+			return nil, closeErr
+		}
+
+		if responseErr := apiResponseError(action, r, buf); responseErr != nil {
+			if errors.Is(responseErr, EBADRESP) {
+				if !retryable {
+					return buf, uncertain(responseErr)
+				}
+				return buf, responseErr
+			}
+			if errors.Is(responseErr, EAGAIN) && retryable {
+				lastErr = responseErr
+				continue
+			}
+			return buf, responseErr
+		}
+		return buf, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("API request exhausted without a response")
+	}
+	return nil, lastErr
 }
 
 // prelogin call
 func (m *Mega) prelogin(email string) error {
+	return m.preloginContext(context.Background(), email)
+}
+
+func (m *Mega) preloginContext(ctx context.Context, email string) error {
 	var msg [1]PreloginMsg
 	var res [1]PreloginResp
 
@@ -566,7 +1474,7 @@ func (m *Mega) prelogin(email string) error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_context(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -596,6 +1504,10 @@ func (m *Mega) prelogin(email string) error {
 
 // Authenticate and start a session
 func (m *Mega) login(email string, passwd string, multiFactor string) error {
+	return m.loginContext(context.Background(), email, passwd, multiFactor)
+}
+
+func (m *Mega) loginContext(ctx context.Context, email string, passwd string, multiFactor string) error {
 	var msg [1]LoginMsg
 	var res [1]LoginResp
 	var err error
@@ -639,7 +1551,7 @@ func (m *Mega) login(email string, passwd string, multiFactor string) error {
 	if err != nil {
 		return err
 	}
-	result, err = m.api_request(req)
+	result, err = m.api_request_context(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -670,33 +1582,56 @@ func (m *Mega) Login(email string, passwd string) error {
 	return m.MultiFactorLogin(email, passwd, "")
 }
 
+// LoginContext authenticates without multi-factor authentication using ctx.
+func (m *Mega) LoginContext(ctx context.Context, email string, passwd string) error {
+	return m.MultiFactorLoginContext(ctx, email, passwd, "")
+}
+
 // MultiFactorLogin - Authenticate and start a session with 2FA
 func (m *Mega) MultiFactorLogin(email, passwd, multiFactor string) error {
-	err := m.prelogin(email)
+	return m.MultiFactorLoginContext(context.Background(), email, passwd, multiFactor)
+}
+
+// MultiFactorLoginContext authenticates and initializes the session using ctx.
+func (m *Mega) MultiFactorLoginContext(ctx context.Context, email, passwd, multiFactor string) error {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_ = m.Close()
+	err := m.preloginContext(ctx, email)
 	if err != nil {
 		return err
 	}
 
-	err = m.login(email, passwd, multiFactor)
+	err = m.loginContext(ctx, email, passwd, multiFactor)
 	if err != nil {
 		return err
 	}
 
-	return m.postAuthInit()
+	return m.postAuthInitContext(ctx)
 }
 
 // Finish initializing the Mega client after Login*()
 func (m *Mega) postAuthInit() error {
+	return m.postAuthInitContext(context.Background())
+}
+
+func (m *Mega) postAuthInitContext(ctx context.Context) error {
 
 	waitEvent := m.WaitEventsStart()
 
-	err := m.getFileSystem()
+	err := m.getFileSystemContext(ctx)
 	if err != nil {
+		m.removeWaitEvent(waitEvent)
 		return err
 	}
 
 	// Wait until the all the pending events have been received
-	m.WaitEvents(waitEvent, 5*time.Second)
+	if _, err := m.waitEventsContext(ctx, waitEvent, 5*time.Second); err != nil {
+		m.removeWaitEvent(waitEvent)
+		return err
+	}
 
 	return nil
 }
@@ -718,6 +1653,12 @@ func (m *Mega) WaitEventsStart() <-chan struct{} {
 //
 // If the timeout elapsed then it returns true otherwise false.
 func (m *Mega) WaitEvents(eventChan <-chan struct{}, duration time.Duration) (timedout bool) {
+	timedout, _ = m.waitEventsContext(context.Background(), eventChan, duration)
+	return timedout
+}
+
+func (m *Mega) waitEventsContext(ctx context.Context, eventChan <-chan struct{}, duration time.Duration) (timedout bool, err error) {
+	ctx = contextOrBackground(ctx)
 	m.debugf("Waiting for events to be finished for %v", duration)
 	timer := time.NewTimer(duration)
 	select {
@@ -727,9 +1668,11 @@ func (m *Mega) WaitEvents(eventChan <-chan struct{}, duration time.Duration) (ti
 	case <-timer.C:
 		m.debugf("Timeout waiting for events")
 		timedout = true
+	case <-ctx.Done():
+		err = ctx.Err()
 	}
 	timer.Stop()
-	return timedout
+	return timedout, err
 }
 
 // waitEventsFire - fire the wait event
@@ -745,8 +1688,24 @@ func (m *Mega) waitEventsFire() {
 	m.waitEventsMu.Unlock()
 }
 
+func (m *Mega) removeWaitEvent(eventChan <-chan struct{}) {
+	m.waitEventsMu.Lock()
+	defer m.waitEventsMu.Unlock()
+	for i, ch := range m.waitEvents {
+		if ch == eventChan {
+			m.waitEvents = append(m.waitEvents[:i], m.waitEvents[i+1:]...)
+			return
+		}
+	}
+}
+
 // Get user information
 func (m *Mega) GetUser() (UserResp, error) {
+	return m.GetUserContext(context.Background())
+}
+
+// GetUserContext fetches user information using ctx.
+func (m *Mega) GetUserContext(ctx context.Context) (UserResp, error) {
 	var msg [1]UserMsg
 	var res [1]UserResp
 
@@ -756,7 +1715,7 @@ func (m *Mega) GetUser() (UserResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_context(ctx, req)
 	if err != nil {
 		return res[0], err
 	}
@@ -767,6 +1726,11 @@ func (m *Mega) GetUser() (UserResp, error) {
 
 // Get quota information
 func (m *Mega) GetQuota() (QuotaResp, error) {
+	return m.GetQuotaContext(context.Background())
+}
+
+// GetQuotaContext fetches quota information using ctx.
+func (m *Mega) GetQuotaContext(ctx context.Context) (QuotaResp, error) {
 	var msg [1]QuotaMsg
 	var res [1]QuotaResp
 
@@ -778,7 +1742,7 @@ func (m *Mega) GetQuota() (QuotaResp, error) {
 	if err != nil {
 		return res[0], err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_context(ctx, req)
 	if err != nil {
 		return res[0], err
 	}
@@ -793,6 +1757,12 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 	var attr FileAttr
 	var node, parent *Node
 	var err error
+	if itm.Hash == "" {
+		return nil, errors.New("filesystem node has no handle")
+	}
+	if itm.T < FILE || itm.T > TRASH {
+		return nil, fmt.Errorf("filesystem node %q has unknown type %d", itm.Hash, itm.T)
+	}
 
 	master_aes, err := aes.NewCipher(m.k)
 	if err != nil {
@@ -890,8 +1860,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 		switch {
 		case itm.T == FILE:
 			if len(compkey) < 8 {
-				m.logf("ignoring item: compkey too short (%d): %#v", len(compkey), itm)
-				return nil, nil
+				return nil, fmt.Errorf("filesystem node %q has an incomplete file key", itm.Hash)
 			}
 			key = []uint32{compkey[0] ^ compkey[4], compkey[1] ^ compkey[5], compkey[2] ^ compkey[6], compkey[3] ^ compkey[7]}
 		default:
@@ -900,14 +1869,11 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 
 		bkey, err := a32_to_bytes(key)
 		if err != nil {
-			// FIXME:
-			attr.Name = "BAD ATTRIBUTE"
-		} else {
-			attr, err = decryptAttr(bkey, itm.Attr)
-			// FIXME:
-			if err != nil {
-				attr.Name = "BAD ATTRIBUTE"
-			}
+			return nil, err
+		}
+		attr, err = decryptAttr(bkey, itm.Attr)
+		if err != nil {
+			return nil, fmt.Errorf("filesystem node %q has an invalid encrypted attribute: %w", itm.Hash, err)
 		}
 	}
 
@@ -1006,6 +1972,10 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 
 // Get all nodes from filesystem
 func (m *Mega) getFileSystem() error {
+	return m.getFileSystemContext(context.Background())
+}
+
+func (m *Mega) getFileSystemContext(ctx context.Context) error {
 	m.FS.mutex.Lock()
 	defer m.FS.mutex.Unlock()
 
@@ -1019,7 +1989,7 @@ func (m *Mega) getFileSystem() error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_context(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -1036,14 +2006,13 @@ func (m *Mega) getFileSystem() error {
 	for _, itm := range res[0].F {
 		_, err = m.addFSNode(itm)
 		if err != nil {
-			m.debugf("couldn't decode FSNode %#v: %v ", itm, err)
-			continue
+			return fmt.Errorf("getFileSystem: invalid node %q: %w", itm.Hash, err)
 		}
 	}
 
 	m.ssn = res[0].Sn
 
-	go m.pollEvents()
+	m.startEventPoller()
 
 	return nil
 }
@@ -1067,9 +2036,14 @@ var zero_iv = make([]byte, 16)
 // Create a new Download from the src Node
 //
 // Call Chunks to find out how many chunks there are, then for id =
-// 0..chunks-1 call DownloadChunk.  Finally call Finish() to receive
+// 0..chunks-1 call DownloadChunk. Finally call Finish() to receive
 // the error status.
 func (m *Mega) NewDownload(src *Node) (*Download, error) {
+	return m.NewDownloadContext(context.Background(), src)
+}
+
+// NewDownloadContext creates a download using ctx for its API request.
+func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, error) {
 	if src == nil {
 		return nil, EARGS
 	}
@@ -1091,7 +2065,7 @@ func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.api_request_context(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -1166,6 +2140,15 @@ func (d *Download) ChunkLocation(id int) (position int64, size int, err error) {
 // DownloadChunk gets a chunk with the given number and update the
 // mac, returning the position in the file of the chunk
 func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
+	return d.DownloadChunkContext(context.Background(), id)
+}
+
+// DownloadChunkContext downloads and decrypts one chunk using ctx.
+func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []byte, err error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if id < 0 || id >= len(d.chunks) {
 		return nil, EARGS
 	}
@@ -1179,22 +2162,46 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 	chunk_url := fmt.Sprintf("%s/%d-%d", d.resourceUrl, chk_start, chk_start+int64(chk_size)-1)
 	sleepTime := minSleepTime // initial backoff time
 	for retry := 0; retry < d.m.retries+1; retry++ {
-		resp, err = d.m.client.Get(chunk_url)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var req *http.Request
+		req, err = http.NewRequestWithContext(ctx, http.MethodGet, chunk_url, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err = d.m.client.Do(req)
 		if err == nil {
-			if resp.StatusCode == 200 {
+			if resp != nil && resp.StatusCode == http.StatusOK {
 				break
 			}
-			err = errors.New("Http Status: " + resp.Status)
-			_ = resp.Body.Close()
+			if resp == nil {
+				err = errors.New("HTTP client returned a nil response")
+			} else {
+				err = errors.New("Http Status: " + resp.Status)
+				closeAPIResponse(resp)
+			}
 		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		err = sanitizeAPIError(err, chunk_url)
 		d.m.debugf("%s: Retry download chunk %d/%d: %v", d.src.name, retry, d.m.retries, err)
-		backOffSleep(&sleepTime)
+		if retry+1 < d.m.retries+1 {
+			if err := sleepContext(ctx, sleepTime); err != nil {
+				return nil, err
+			}
+			advanceBackoff(&sleepTime)
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
 	if resp == nil {
 		return nil, errors.New("retries exceeded")
+	}
+	if resp.Body == nil {
+		return nil, errors.New("HTTP response body is nil")
 	}
 
 	chunk, err = io.ReadAll(resp.Body)
@@ -1250,19 +2257,39 @@ func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 // Finish checks the accumulated MAC for each block.
 //
 // If all the chunks weren't downloaded then it will just return nil
-func (d *Download) Finish() (err error) {
+func (d *Download) Finish() error {
+	return d.FinishContext(context.Background())
+}
+
+// FinishContext verifies the downloaded file MAC and stops promptly when ctx
+// is canceled. It does not perform network requests.
+func (d *Download) FinishContext(ctx context.Context) error {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Can't check a 0 sized file
 	if len(d.chunk_macs) == 0 {
 		return nil
 	}
 	mac_data := make([]byte, 16)
+	var macEnc cipher.BlockMode
 	for _, v := range d.chunk_macs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// If a chunk_macs hasn't been set then the whole file
 		// wasn't downloaded and we can't check it
 		if v == nil {
 			return nil
 		}
-		d.mac_enc.CryptBlocks(mac_data, v)
+		if macEnc == nil {
+			if d.aes_block == nil {
+				return errors.New("download cipher is not initialized")
+			}
+			macEnc = cipher.NewCBCEncrypter(d.aes_block, zero_iv)
+		}
+		macEnc.CryptBlocks(mac_data, v)
 	}
 
 	tmac, err := bytes_to_a32(mac_data)
@@ -1282,36 +2309,91 @@ func (d *Download) Finish() (err error) {
 
 // Download file from filesystem reporting progress if not nil
 func (m *Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error {
+	return m.DownloadFileContext(context.Background(), src, dstpath, progress)
+}
+
+// DownloadFileContext downloads a file and cancels outstanding chunk requests
+// when ctx is canceled or any worker fails.
+func (m *Mega) DownloadFileContext(ctx context.Context, src *Node, dstpath string, progress *chan int) error {
 	defer func() {
 		if progress != nil {
 			close(*progress)
 		}
 	}()
-
-	d, err := m.NewDownload(src)
-	if err != nil {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	_, err = os.Stat(dstpath)
-	if os.IsExist(err) {
-		err = os.Remove(dstpath)
-		if err != nil {
-			return err
+	d, err := m.NewDownloadContext(ctx, src)
+	if err != nil {
+		return err
+	}
+	return downloadToPathContext(ctx, d, dstpath, progress)
+}
+
+// downloadToPathContext stages a complete, MAC-verified download beside the
+// destination and replaces the destination only after every check succeeds.
+func downloadToPathContext(ctx context.Context, d *Download, dstpath string, progress *chan int) error {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if dstpath == "" {
+		return os.ErrInvalid
+	}
+	if d == nil {
+		return errors.New("download is not initialized")
+	}
+	if d.Chunks() > 0 && d.m == nil {
+		return errors.New("download client is not initialized")
+	}
+	workers := 0
+	if d.m != nil {
+		workers = d.m.dl_workers
+	}
+	if d.Chunks() > 0 && workers <= 0 {
+		return EWORKER_COUNT_INVALID
+	}
+
+	destInfo, err := os.Lstat(dstpath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil {
+		if destInfo.Mode()&os.ModeSymlink != 0 {
+			return errors.New("download destination is a symlink")
+		}
+		if !destInfo.Mode().IsRegular() {
+			return errors.New("download destination is not a regular file")
 		}
 	}
 
-	outfile, err := os.OpenFile(dstpath, os.O_RDWR|os.O_CREATE, 0600)
+	outfile, err := os.CreateTemp(filepath.Dir(dstpath), ".mega-download-*.partial")
 	if err != nil {
 		return err
 	}
+	tempPath := outfile.Name()
+	defer func() {
+		_ = outfile.Close()
+		_ = os.Remove(tempPath)
+	}()
 
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	workch := make(chan int)
-	errch := make(chan error, m.dl_workers)
+	errch := make(chan error, workers)
 	wg := sync.WaitGroup{}
+	reportErr := func(err error) {
+		select {
+		case errch <- err:
+		default:
+		}
+		cancel()
+	}
 
 	// Fire chunk download workers
-	for w := 0; w < m.dl_workers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 
 		go func() {
@@ -1319,26 +2401,37 @@ func (m *Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error
 
 			// Wait for work blocked on channel
 			for id := range workch {
-				chunk, err := d.DownloadChunk(id)
+				if workCtx.Err() != nil {
+					return
+				}
+				chunk, err := d.DownloadChunkContext(workCtx, id)
 				if err != nil {
-					errch <- err
+					reportErr(err)
 					return
 				}
 
 				chk_start, _, err := d.ChunkLocation(id)
 				if err != nil {
-					errch <- err
+					reportErr(err)
 					return
 				}
 
-				_, err = outfile.WriteAt(chunk, chk_start)
+				written, writeErr := outfile.WriteAt(chunk, chk_start)
+				err = writeErr
+				if err == nil && written != len(chunk) {
+					err = io.ErrShortWrite
+				}
 				if err != nil {
-					errch <- err
+					reportErr(err)
 					return
 				}
 
 				if progress != nil {
-					*progress <- len(chunk)
+					select {
+					case *progress <- len(chunk):
+					case <-workCtx.Done():
+						return
+					}
 				}
 			}
 		}()
@@ -1348,6 +2441,12 @@ func (m *Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error
 	err = nil
 	for id := 0; id < d.Chunks() && err == nil; {
 		select {
+		case <-workCtx.Done():
+			select {
+			case err = <-errch:
+			default:
+				err = workCtx.Err()
+			}
 		case workch <- id:
 			id++
 		case err = <-errch:
@@ -1356,17 +2455,57 @@ func (m *Mega) DownloadFile(src *Node, dstpath string, progress *chan int) error
 	close(workch)
 
 	wg.Wait()
+	err = collectWorkerErrors(err, errch)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 
+	if err == nil && destInfo != nil {
+		err = outfile.Chmod(destInfo.Mode().Perm())
+	}
+	if err == nil {
+		err = outfile.Sync()
+	}
 	closeErr := outfile.Close()
+	if err == nil {
+		err = closeErr
+	}
 	if err != nil {
-		_ = os.Remove(dstpath)
 		return err
 	}
-	if closeErr != nil {
-		return closeErr
+	if err := d.FinishContext(ctx); err != nil {
+		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, dstpath)
+}
 
-	return d.Finish()
+func collectWorkerErrors(primary error, errch <-chan error) error {
+	var firstWorkerErr error
+	var uncertainWorkerErr error
+	for {
+		select {
+		case workerErr := <-errch:
+			if workerErr != nil {
+				if firstWorkerErr == nil {
+					firstWorkerErr = workerErr
+				}
+				if uncertainWorkerErr == nil && errors.Is(workerErr, ErrOutcomeUnknown) {
+					uncertainWorkerErr = workerErr
+				}
+			}
+		default:
+			if uncertainWorkerErr != nil {
+				return uncertainWorkerErr
+			}
+			if primary != nil {
+				return primary
+			}
+			return firstWorkerErr
+		}
+	}
 }
 
 // Upload contains the internal state of a upload
@@ -1393,6 +2532,11 @@ type Upload struct {
 // 0..chunks-1 Call ChunkLocation then UploadChunk.  Finally call
 // Finish() to receive the error status and the *Node.
 func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, error) {
+	return m.NewUploadContext(context.Background(), parent, name, fileSize)
+}
+
+// NewUploadContext starts an upload using ctx for its API request.
+func (m *Mega) NewUploadContext(ctx context.Context, parent *Node, name string, fileSize int64) (*Upload, error) {
 	if parent == nil {
 		return nil, EARGS
 	}
@@ -1411,7 +2555,7 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(request)
+	result, err := m.api_request_context(ctx, request)
 	if err != nil {
 		return nil, err
 	}
@@ -1492,6 +2636,16 @@ func (u *Upload) ChunkLocation(id int) (position int64, size int, err error) {
 
 // UploadChunk uploads the chunk of id
 func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
+	return u.UploadChunkContext(context.Background(), id, chunk)
+}
+
+// UploadChunkContext uploads one chunk using ctx. Upload chunk POSTs are never
+// replayed automatically because a transport failure can follow server acceptance.
+func (u *Upload) UploadChunkContext(ctx context.Context, id int, chunk []byte) (err error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	chk_start, chk_size, err := u.ChunkLocation(id)
 	if err != nil {
 		return err
@@ -1515,7 +2669,8 @@ func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
 
 	i := 0
 	block := make([]byte, 16)
-	paddedchunk := paddnull(chunk, 16)
+	chunkCopy := append([]byte(nil), chunk...)
+	paddedchunk := paddnull(chunkCopy, 16)
 	for i = 0; i < len(paddedchunk); i += 16 {
 		copy(block[0:16], paddedchunk[i:i+16])
 		enc.CryptBlocks(block, block)
@@ -1523,43 +2678,49 @@ func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
 
 	var rsp *http.Response
 	var req *http.Request
-	ctr_aes.XORKeyStream(chunk, chunk)
+	encryptedChunk := append([]byte(nil), chunkCopy...)
+	ctr_aes.XORKeyStream(encryptedChunk, encryptedChunk)
 	chk_url := fmt.Sprintf("%s/%d", u.uploadUrl, chk_start)
-
-	sleepTime := minSleepTime // initial backoff time
-	for retry := 0; retry < u.m.retries+1; retry++ {
-		reader := bytes.NewBuffer(chunk)
-		req, err = http.NewRequest("POST", chk_url, reader)
-		if err != nil {
-			return err
-		}
-		rsp, err = u.m.client.Do(req)
-		if err == nil {
-			if rsp.StatusCode == 200 {
-				break
-			}
-			err = errors.New("Http Status: " + rsp.Status)
-			_ = rsp.Body.Close()
-		}
-		u.m.debugf("%s: Retry upload chunk %d/%d: %v", u.name, retry, u.m.retries, err)
-		backOffSleep(&sleepTime)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	reader := bytes.NewBuffer(encryptedChunk)
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, chk_url, reader)
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rsp, err = u.m.client.Do(req)
+	if err != nil {
+		closeAPIResponse(rsp)
+		return uncertainOutcomeError("upload chunk", sanitizeAPIError(err, chk_url))
+	}
 	if rsp == nil {
-		return errors.New("retries exceeded")
+		return uncertainOutcomeError("upload chunk", errors.New("HTTP client returned a nil response"))
+	}
+	if rsp.StatusCode != http.StatusOK {
+		statusErr := errors.New("Http Status: " + rsp.Status)
+		closeAPIResponse(rsp)
+		return uncertainOutcomeError("upload chunk", statusErr)
+	}
+	if rsp.Body == nil {
+		return uncertainOutcomeError("upload chunk", errors.New("HTTP response body is nil"))
+	}
+	if ctx.Err() != nil {
+		return uncertainOutcomeError("upload chunk", ctx.Err())
 	}
 
 	chunk_resp, err := io.ReadAll(rsp.Body)
 	if err != nil {
 		_ = rsp.Body.Close()
-		return err
+		return uncertainOutcomeError("upload chunk", sanitizeAPIError(err, chk_url))
 	}
 
 	err = rsp.Body.Close()
 	if err != nil {
-		return err
+		return uncertainOutcomeError("upload chunk", sanitizeAPIError(err, chk_url))
 	}
 
 	if !bytes.Equal(chunk_resp, nil) {
@@ -1581,9 +2742,31 @@ func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
 
 // Finish completes the upload and returns the created node
 func (u *Upload) Finish() (node *Node, err error) {
+	return u.FinishContext(context.Background())
+}
+
+// FinishContext finalizes an upload using ctx.
+func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	mac_data := make([]byte, 16)
+	var macEnc cipher.BlockMode
 	for _, v := range u.chunk_macs {
-		u.mac_enc.CryptBlocks(mac_data, v)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if v == nil {
+			return nil, errors.New("upload chunk MAC is not initialized")
+		}
+		if macEnc == nil {
+			if u.aes_block == nil {
+				return nil, errors.New("upload cipher is not initialized")
+			}
+			macEnc = cipher.NewCBCEncrypter(u.aes_block, zero_iv)
+		}
+		macEnc.CryptBlocks(mac_data, v)
 	}
 
 	t, err := bytes_to_a32(mac_data)
@@ -1630,28 +2813,52 @@ func (u *Upload) Finish() (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := u.m.api_request(request)
+	result, err := u.m.api_request_context(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 
 	err = json.Unmarshal(result, &cres)
 	if err != nil {
-		return nil, err
+		return nil, uncertainOutcomeError("p", err)
+	}
+	if len(cres[0].F) == 0 {
+		return nil, uncertainOutcomeError("p", EBADRESP)
 	}
 
 	u.m.FS.mutex.Lock()
 	defer u.m.FS.mutex.Unlock()
-	return u.m.addFSNode(cres[0].F[0])
+	node, err = u.m.addFSNode(cres[0].F[0])
+	if err != nil {
+		return nil, uncertainOutcomeError("p", err)
+	}
+	if node == nil {
+		return nil, uncertainOutcomeError("p", EBADRESP)
+	}
+	return node, nil
 }
 
 // Upload a file to the filesystem
 func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *chan int) (node *Node, err error) {
+	return m.UploadFileContext(context.Background(), srcpath, parent, name, progress)
+}
+
+// UploadFileContext uploads a file and cancels outstanding work when ctx is
+// canceled or any worker fails. An interrupted chunk upload reports an
+// uncertain outcome and is never replayed automatically.
+func (m *Mega) UploadFileContext(ctx context.Context, srcpath string, parent *Node, name string, progress *chan int) (node *Node, err error) {
 	defer func() {
 		if progress != nil {
 			close(*progress)
 		}
 	}()
+	ctx = contextOrBackground(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.ul_workers <= 0 {
+		return nil, EWORKER_COUNT_INVALID
+	}
 
 	var infile *os.File
 	var fileSize int64
@@ -1676,14 +2883,23 @@ func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *c
 		name = filepath.Base(srcpath)
 	}
 
-	u, err := m.NewUpload(parent, name, fileSize)
+	u, err := m.NewUploadContext(ctx, parent, name, fileSize)
 	if err != nil {
 		return nil, err
 	}
 
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	workch := make(chan int)
 	errch := make(chan error, m.ul_workers)
 	wg := sync.WaitGroup{}
+	reportErr := func(err error) {
+		select {
+		case errch <- err:
+		default:
+		}
+		cancel()
+	}
 
 	// Fire chunk upload workers
 	for w := 0; w < m.ul_workers; w++ {
@@ -1693,30 +2909,37 @@ func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *c
 			defer wg.Done()
 
 			for id := range workch {
+				if workCtx.Err() != nil {
+					return
+				}
 				chk_start, chk_size, err := u.ChunkLocation(id)
 				if err != nil {
-					errch <- err
+					reportErr(err)
 					return
 				}
 				chunk := make([]byte, chk_size)
 				n, err := infile.ReadAt(chunk, chk_start)
 				if err != nil && err != io.EOF {
-					errch <- err
+					reportErr(err)
 					return
 				}
 				if n != len(chunk) {
-					errch <- errors.New("chunk too short")
+					reportErr(errors.New("chunk too short"))
 					return
 				}
 
-				err = u.UploadChunk(id, chunk)
+				err = u.UploadChunkContext(workCtx, id, chunk)
 				if err != nil {
-					errch <- err
+					reportErr(err)
 					return
 				}
 
 				if progress != nil {
-					*progress <- chk_size
+					select {
+					case *progress <- chk_size:
+					case <-workCtx.Done():
+						return
+					}
 				}
 			}
 		}()
@@ -1726,6 +2949,12 @@ func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *c
 	err = nil
 	for id := 0; id < u.Chunks() && err == nil; {
 		select {
+		case <-workCtx.Done():
+			select {
+			case err = <-errch:
+			default:
+				err = workCtx.Err()
+			}
 		case workch <- id:
 			id++
 		case err = <-errch:
@@ -1735,16 +2964,25 @@ func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *c
 	close(workch)
 
 	wg.Wait()
+	err = collectWorkerErrors(err, errch)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	return u.Finish()
+	return u.FinishContext(ctx)
 }
 
 // Move a file from one location to another
 func (m *Mega) Move(src *Node, parent *Node) error {
+	return m.MoveContext(context.Background(), src, parent)
+}
+
+// MoveContext moves a node using ctx for the API request.
+func (m *Mega) MoveContext(ctx context.Context, src *Node, parent *Node) error {
 	m.FS.mutex.Lock()
 	defer m.FS.mutex.Unlock()
 
@@ -1766,7 +3004,7 @@ func (m *Mega) Move(src *Node, parent *Node) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(request)
+	_, err = m.api_request_context(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -1783,6 +3021,11 @@ func (m *Mega) Move(src *Node, parent *Node) error {
 
 // Rename a file or folder
 func (m *Mega) Rename(src *Node, name string) error {
+	return m.RenameContext(context.Background(), src, name)
+}
+
+// RenameContext renames a node using ctx for the API request.
+func (m *Mega) RenameContext(ctx context.Context, src *Node, name string) error {
 	m.FS.mutex.Lock()
 	defer m.FS.mutex.Unlock()
 
@@ -1819,7 +3062,7 @@ func (m *Mega) Rename(src *Node, name string) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.api_request_context(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -1831,6 +3074,11 @@ func (m *Mega) Rename(src *Node, name string) error {
 
 // Create a directory in the filesystem
 func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
+	return m.CreateDirContext(context.Background(), name, parent)
+}
+
+// CreateDirContext creates a directory using ctx for the API request.
+func (m *Mega) CreateDirContext(ctx context.Context, name string, parent *Node) (*Node, error) {
 	m.FS.mutex.Lock()
 	defer m.FS.mutex.Unlock()
 
@@ -1879,27 +3127,41 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_context(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
 	err = json.Unmarshal(result, &res)
 	if err != nil {
-		return nil, err
+		return nil, uncertainOutcomeError("p", err)
+	}
+	if len(res[0].F) == 0 {
+		return nil, uncertainOutcomeError("p", EBADRESP)
 	}
 	node, err := m.addFSNode(res[0].F[0])
+	if err != nil {
+		return nil, uncertainOutcomeError("p", err)
+	}
+	if node == nil {
+		return nil, uncertainOutcomeError("p", EBADRESP)
+	}
 
-	return node, err
+	return node, nil
 }
 
 // Delete a file or directory from filesystem
 func (m *Mega) Delete(node *Node, destroy bool) error {
+	return m.DeleteContext(context.Background(), node, destroy)
+}
+
+// DeleteContext deletes or trashes a node using ctx for its API request.
+func (m *Mega) DeleteContext(ctx context.Context, node *Node, destroy bool) error {
 	if node == nil {
 		return EARGS
 	}
 	if !destroy {
-		return m.Move(node, m.FS.trash)
+		return m.MoveContext(ctx, node, m.FS.trash)
 	}
 
 	m.FS.mutex.Lock()
@@ -1918,7 +3180,7 @@ func (m *Mega) Delete(node *Node, destroy bool) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.api_request(req)
+	_, err = m.api_request_context(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -2002,29 +3264,51 @@ func (m *Mega) processDeleteNode(evRaw []byte) error {
 }
 
 // Listen for server event notifications and play actions
-func (m *Mega) pollEvents() {
+func (m *Mega) pollEvents(ctx context.Context) {
 	var err error
 	var resp *http.Response
 	sleepTime := minSleepTime // initial backoff time
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
-			m.debugf("pollEvents: error from server", err)
-			backOffSleep(&sleepTime)
+			m.debugf("pollEvents: error from server: %v", sanitizeAPIError(err, m.sid))
+			if sleepContext(ctx, sleepTime) != nil {
+				return
+			}
+			advanceBackoff(&sleepTime)
 		} else {
 			// reset sleep time to minimum on success
 			sleepTime = minSleepTime
 		}
 
 		url := fmt.Sprintf("%s/sc?sn=%s&sid=%s", m.baseurl, m.ssn, m.sid)
-		resp, err = m.client.Post(url, "application/xml", nil)
+		var req *http.Request
+		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err == nil {
+			req.Header.Set("Content-Type", "application/xml")
+			resp, err = m.client.Do(req)
+		}
 		if err != nil {
-			m.logf("pollEvents: Error fetching status: %s", err)
+			if ctx.Err() != nil {
+				return
+			}
+			m.logf("pollEvents: Error fetching status: %s", sanitizeAPIError(err, m.sid))
+			continue
+		}
+		if resp == nil {
+			err = errors.New("HTTP client returned a nil response")
 			continue
 		}
 
 		if resp.StatusCode != 200 {
 			m.logf("pollEvents: Error from server: %s", resp.Status)
-			_ = resp.Body.Close()
+			closeAPIResponse(resp)
+			continue
+		}
+		if resp.Body == nil {
+			err = errors.New("HTTP response body is nil")
 			continue
 		}
 
@@ -2068,9 +3352,18 @@ func (m *Mega) pollEvents() {
 			if len(events.E) > 0 {
 				m.logf("pollEvents: Unexpected event with w set: %s", buf)
 			}
-			resp, err = m.client.Get(events.W)
+			var waitReq *http.Request
+			waitReq, err = http.NewRequestWithContext(ctx, http.MethodGet, events.W, nil)
 			if err == nil {
-				_ = resp.Body.Close()
+				resp, err = m.client.Do(waitReq)
+			}
+			if err == nil && resp != nil {
+				closeAPIResponse(resp)
+			} else if err == nil {
+				err = errors.New("HTTP client returned a nil response")
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			continue
 		}
@@ -2078,6 +3371,9 @@ func (m *Mega) pollEvents() {
 
 		// For each event in the array, parse it
 		for _, evRaw := range events.E {
+			if ctx.Err() != nil {
+				return
+			}
 			// First attempt to unmarshal as an error message
 			var emsg ErrorMsg
 			err = json.Unmarshal(evRaw, &emsg)
@@ -2139,6 +3435,10 @@ func (m *Mega) pollEvents() {
 }
 
 func (m *Mega) getLink(n *Node) (string, error) {
+	return m.getLinkContext(context.Background(), n)
+}
+
+func (m *Mega) getLinkContext(ctx context.Context, n *Node) (string, error) {
 	var msg [1]GetLinkMsg
 	var res [1]string
 
@@ -2149,7 +3449,7 @@ func (m *Mega) getLink(n *Node) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	result, err := m.api_request(req)
+	result, err := m.api_request_context(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -2162,7 +3462,12 @@ func (m *Mega) getLink(n *Node) (string, error) {
 
 // Exports public link for node, with or without decryption key included
 func (m *Mega) Link(n *Node, includeKey bool) (string, error) {
-	id, err := m.getLink(n)
+	return m.LinkContext(context.Background(), n, includeKey)
+}
+
+// LinkContext exports a node link using ctx for the API request.
+func (m *Mega) LinkContext(ctx context.Context, n *Node, includeKey bool) (string, error) {
+	id, err := m.getLinkContext(ctx, n)
 	if err != nil {
 		return "", err
 	}

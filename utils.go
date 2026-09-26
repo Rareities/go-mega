@@ -309,22 +309,31 @@ func decryptAttr(key []byte, data string) (attr FileAttr, err error) {
 		return attr, err
 	}
 	mode := cipher.NewCBCDecrypter(block, iv)
-	buf := make([]byte, len(data))
 	ddata, err := base64urldecode(data)
 	if err != nil {
 		return attr, err
 	}
+	if len(ddata) == 0 || len(ddata)%block.BlockSize() != 0 {
+		return attr, EBADATTR
+	}
+	buf := make([]byte, len(ddata))
 	mode.CryptBlocks(buf, ddata)
 
-	if string(buf[:4]) == "MEGA" {
-		str := strings.TrimRight(string(buf[4:]), "\x00")
-		trimmed := attrMatch.FindString(str)
-		if trimmed != "" {
-			str = trimmed
-		}
-		err = json.Unmarshal([]byte(str), &attr)
+	if len(buf) < len("MEGA") || !bytes.Equal(buf[:len("MEGA")], []byte("MEGA")) {
+		return attr, EBADATTR
 	}
-	return attr, err
+	str := strings.TrimRight(string(buf[len("MEGA"):]), "\x00")
+	trimmed := attrMatch.FindString(str)
+	if trimmed != "" {
+		str = trimmed
+	}
+	if err := json.Unmarshal([]byte(str), &attr); err != nil {
+		return attr, errors.Join(EBADATTR, err)
+	}
+	if attr.Name == "" {
+		return attr, EBADATTR
+	}
+	return attr, nil
 }
 
 func encryptAttr(key []byte, attr FileAttr) (b string, err error) {

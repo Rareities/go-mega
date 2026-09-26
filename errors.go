@@ -3,6 +3,9 @@ package mega
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
+	"strings"
 )
 
 var (
@@ -12,6 +15,10 @@ var (
 	EAGAIN     = errors.New("Try again")
 	ERATELIMIT = errors.New("Rate limit reached")
 	EBADRESP   = errors.New("Bad response from server")
+
+	// ErrOutcomeUnknown marks a request that may have been accepted even though
+	// its result could not be confirmed.
+	ErrOutcomeUnknown = errors.New("request outcome is unknown")
 
 	// Upload errors
 	EFAILED  = errors.New("The upload failed. Please restart it from scratch")
@@ -42,7 +49,116 @@ var (
 
 	// Config errors
 	EWORKER_LIMIT_EXCEEDED = errors.New("Maximum worker limit exceeded")
+	EWORKER_COUNT_INVALID  = errors.New("Worker count must be positive")
 )
+
+// UncertainOutcomeError reports that an API request may have succeeded, but
+// the client did not receive a response that could confirm its outcome.
+type UncertainOutcomeError struct {
+	Action string
+	Err    error
+}
+
+func (e *UncertainOutcomeError) Error() string {
+	action := e.Action
+	if action == "" {
+		action = "unknown"
+	}
+	if e.Err == nil {
+		return fmt.Sprintf("mega API action %q: %v", action, ErrOutcomeUnknown)
+	}
+	return fmt.Sprintf("mega API action %q: %v: %v", action, ErrOutcomeUnknown, e.Err)
+}
+
+func (e *UncertainOutcomeError) Unwrap() error {
+	return e.Err
+}
+
+func (e *UncertainOutcomeError) Is(target error) bool {
+	return target == ErrOutcomeUnknown
+}
+
+// HTTPStatusError reports an HTTP response with a non-success status.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.Status == "" {
+		return fmt.Sprintf("mega API: unexpected HTTP status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("mega API: unexpected HTTP status %s", e.Status)
+}
+
+// sanitizedAPIError keeps the original error chain available to errors.Is and
+// errors.As while ensuring formatting cannot print a session-bearing request
+// URL from net/http's *url.Error.
+type sanitizedAPIError struct {
+	message string
+	cause   error
+}
+
+func (e *sanitizedAPIError) Error() string { return e.message }
+
+func (e *sanitizedAPIError) Unwrap() error { return e.cause }
+
+func (e *sanitizedAPIError) Format(state fmt.State, verb rune) {
+	if verb == 'q' {
+		_, _ = fmt.Fprintf(state, "%q", e.message)
+		return
+	}
+	_, _ = io.WriteString(state, e.message)
+}
+
+func redactSessionID(value, sid string) string {
+	if sid == "" {
+		return value
+	}
+	for _, secret := range []string{sid, url.QueryEscape(sid), url.PathEscape(sid)} {
+		if secret == "" {
+			continue
+		}
+		value = strings.ReplaceAll(value, "sid="+secret, "sid=[REDACTED]")
+		value = strings.ReplaceAll(value, secret, "[REDACTED]")
+	}
+	return value
+}
+
+func sanitizeAPIError(err error, sid string) error {
+	safeErr, _ := sanitizeAPIErrorValue(err, sid)
+	return safeErr
+}
+
+func sanitizeAPIErrorValue(err error, sid string) (error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	if _, ok := err.(*sanitizedAPIError); ok {
+		return err, false
+	}
+	original := err
+	changed := false
+	// http.Client.Do returns *url.Error directly. Copy it with a redacted URL
+	// so callers extracting it with errors.As cannot recover the session ID.
+	if requestErr, ok := err.(*url.Error); ok {
+		copyOfError := *requestErr
+		redactedURL := redactSessionID(copyOfError.URL, sid)
+		changed = changed || redactedURL != copyOfError.URL
+		copyOfError.URL = redactedURL
+		safeCause, changedCause := sanitizeAPIErrorValue(copyOfError.Err, sid)
+		copyOfError.Err = safeCause
+		changed = changed || changedCause
+		err = &copyOfError
+	}
+	message := err.Error()
+	redactedMessage := redactSessionID(message, sid)
+	changed = changed || redactedMessage != message
+	if !changed {
+		return original, false
+	}
+	return &sanitizedAPIError{message: redactedMessage, cause: err}, true
+}
 
 type ErrorMsg int
 

@@ -8,12 +8,13 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const numReplications = 262144
 const tokenSlotSize = 48
-const doneCtxCheckWhenNthIteration = 1000
+const replicationCtxCheckInterval = 1024
 
 // Base64ToBytes decodes a base64url-encoded string to a byte slice
 func Base64ToBytes(s string) ([]byte, error) {
@@ -59,6 +60,12 @@ func parseHashcash(header string) (easiness int, token string, valid bool) {
 
 // gencash generates a hashcash value based on the token and easiness
 func gencash(ctx context.Context, token string, easiness int) string {
+	select {
+	case <-ctx.Done():
+		return ""
+	default:
+	}
+
 	threshold := uint32((((easiness & 63) << 1) + 1) << ((easiness>>6)*7 + 3))
 	tokenBytes, err := Base64ToBytes(token)
 	if err != nil {
@@ -70,21 +77,26 @@ func gencash(ctx context.Context, token string, easiness int) string {
 
 	// Replicate token data across the buffer
 	for i := 0; i < numReplications; i++ {
+		if i%replicationCtxCheckInterval == 0 {
+			select {
+			case <-ctx.Done():
+				return ""
+			default:
+			}
+		}
 		copy(buffer[4+i*tokenSlotSize:], tokenBytes)
 	}
 
 	prefix := make([]byte, 4)
 
 	// Try different prefixes until we find one that satisfies the threshold
-	iterations := 0
 	for {
-		// Check context every doneCtxCheckWhenNthIteration iterations
-		if iterations++; iterations%doneCtxCheckWhenNthIteration == 0 {
-			select {
-			case <-ctx.Done():
-				return ""
-			default:
-			}
+		// Each attempt hashes the full buffer, so observe cancellation before
+		// starting another expensive attempt.
+		select {
+		case <-ctx.Done():
+			return ""
+		default:
 		}
 
 		// Increment prefix
@@ -112,18 +124,38 @@ func gencash(ctx context.Context, token string, easiness int) string {
 }
 
 func solveHashCashChallenge(token string, easiness int, timeout time.Duration, workers int) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	return solveHashCashChallengeContext(context.Background(), token, easiness, timeout, workers)
+}
 
-	resultChan := make(chan string, workers)
+// solveHashCashChallengeContext solves a challenge until either it succeeds,
+// the caller is canceled, or the existing challenge timeout expires.
+func solveHashCashChallengeContext(parent context.Context, token string, easiness int, timeout time.Duration, workers int) (string, error) {
+	return solveHashCashChallengeContextWithSolver(parent, token, easiness, timeout, workers, gencash)
+}
+
+// solveHashCashChallengeContextWithSolver keeps worker lifecycle behavior
+// testable without making the production solver injectable or global.
+func solveHashCashChallengeContextWithSolver(parent context.Context, token string, easiness int, timeout time.Duration, workers int, solve func(context.Context, string, int) string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		if callerErr := parent.Err(); callerErr != nil {
+			return "", callerErr
+		}
+		return "", err
+	}
+
+	resultChan := make(chan string, 1)
+	var workerGroup sync.WaitGroup
 
 	workerFunc := func() {
+		defer workerGroup.Done()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				result := gencash(ctx, token, easiness)
+				result := solve(ctx, token, easiness)
 				if result != "" {
 					select {
 					case resultChan <- result:
@@ -137,13 +169,34 @@ func solveHashCashChallenge(token string, easiness int, timeout time.Duration, w
 	}
 
 	for i := 0; i < workers; i++ {
+		workerGroup.Add(1)
 		go workerFunc()
 	}
 
+	var result string
+	var solveErr error
 	select {
-	case result := <-resultChan:
-		return result, nil
+	case result = <-resultChan:
 	case <-ctx.Done():
-		return "", ctx.Err()
+		// Prefer the caller's own error so cancellation and an earlier caller
+		// deadline are reported accurately rather than as an internal timeout.
+		solveErr = parent.Err()
+		if solveErr == nil {
+			solveErr = ctx.Err()
+		}
 	}
+
+	// Stop all remaining workers and join them before returning. gencash observes
+	// this context while searching, so cancellation does not leave hash workers
+	// running after their caller has moved on.
+	cancel()
+	workerGroup.Wait()
+
+	if result != "" {
+		if err := parent.Err(); err != nil {
+			return "", err
+		}
+		return result, nil
+	}
+	return "", solveErr
 }
