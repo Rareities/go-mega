@@ -142,6 +142,16 @@ type Mega struct {
 	// context-aware so callers waiting behind another API request can cancel.
 	apiMu   sync.Mutex
 	apiGate chan struct{}
+	// filesystemRefreshMu serializes filesystem snapshots through poller
+	// replacement so concurrent refreshes cannot publish responses out of order.
+	filesystemRefreshMu sync.Mutex
+	// sessionInitMu serializes complete login transitions so one session's
+	// post-auth filesystem refresh cannot run after a later login replaced it.
+	sessionInitMu sync.Mutex
+	// sessionMu protects the sid/master-key pair and its generation. Callers
+	// snapshot the pair before starting requests or account-keyed operations.
+	sessionMu         sync.RWMutex
+	sessionGeneration uint64
 	// pollEvents has a session lifetime independent from individual operations.
 	eventMu     sync.Mutex
 	eventCancel context.CancelFunc
@@ -150,6 +160,73 @@ type Mega struct {
 	waitEventsMu sync.Mutex
 	// Outstanding channels to close to indicate events all received
 	waitEvents []chan struct{}
+}
+
+var errStaleNode = errors.New("node belongs to a different or replaced filesystem session")
+
+type sessionCredentials struct {
+	sessionID        string
+	masterKey        []byte
+	accountVersion   int
+	accountSalt      []byte
+	userHandle       []byte
+	setAccountFields bool
+}
+
+type sessionCredentialsSnapshot struct {
+	sessionID  string
+	masterKey  []byte
+	generation uint64
+}
+
+func sameSession(a, b sessionCredentialsSnapshot) bool {
+	return a.generation == b.generation && a.sessionID == b.sessionID && bytes.Equal(a.masterKey, b.masterKey)
+}
+
+func (m *Mega) snapshotSessionCredentials() sessionCredentialsSnapshot {
+	m.sessionMu.RLock()
+	defer m.sessionMu.RUnlock()
+	return m.snapshotSessionCredentialsLocked()
+}
+
+func (m *Mega) snapshotSessionCredentialsLocked() sessionCredentialsSnapshot {
+	return sessionCredentialsSnapshot{
+		sessionID:  m.sid,
+		masterKey:  append([]byte(nil), m.k...),
+		generation: m.sessionGeneration,
+	}
+}
+
+func (m *Mega) snapshotSessionCredentialsContext(ctx context.Context) (sessionCredentialsSnapshot, error) {
+	ctx = contextOrBackground(ctx)
+	for {
+		if err := ctx.Err(); err != nil {
+			return sessionCredentialsSnapshot{}, err
+		}
+		if m.sessionMu.TryRLock() {
+			if err := ctx.Err(); err != nil {
+				m.sessionMu.RUnlock()
+				return sessionCredentialsSnapshot{}, err
+			}
+			session := m.snapshotSessionCredentialsLocked()
+			m.sessionMu.RUnlock()
+			return session, nil
+		}
+		if err := sleepContext(ctx, fsMutexContextRetryInterval); err != nil {
+			return sessionCredentialsSnapshot{}, err
+		}
+	}
+}
+
+func (m *Mega) validateSessionContext(ctx context.Context, expected sessionCredentialsSnapshot) error {
+	current, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return err
+	}
+	if !sameSession(expected, current) {
+		return errors.New("operation belongs to a replaced session")
+	}
+	return nil
 }
 
 func contextOrBackground(ctx context.Context) context.Context {
@@ -175,6 +252,36 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+const fsMutexContextRetryInterval = 5 * time.Millisecond
+
+// lockMutexContext acquires mutex with the same mutual-exclusion semantics as
+// Lock, but lets context-aware callers abandon a wait. TryLock polling keeps
+// the existing mutex as the single source of synchronization; cancellation is
+// observed within one retry interval, subject to scheduler latency.
+func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
+	ctx = contextOrBackground(ctx)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if mutex.TryLock() {
+			if err := ctx.Err(); err != nil {
+				mutex.Unlock()
+				return err
+			}
+			return nil
+		}
+
+		timer := time.NewTimer(fsMutexContextRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
@@ -224,6 +331,12 @@ func (m *Mega) startEventPoller() {
 	m.eventMu.Lock()
 	defer m.eventMu.Unlock()
 	m.stopEventPollerLocked()
+	m.startEventPollerLocked()
+}
+
+// startEventPollerLocked starts the session poller while eventMu is held and
+// assumes any previous poller has already been stopped and joined.
+func (m *Mega) startEventPollerLocked() {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.eventCancel = cancel
 	done := make(chan struct{})
@@ -245,15 +358,18 @@ const (
 
 // Filesystem node
 type Node struct {
-	fs       *MegaFS
-	name     string
-	hash     string
-	parent   *Node
-	children []*Node
-	ntype    int
-	size     int64
-	ts       time.Time
-	meta     NodeMeta
+	fs *MegaFS
+	// sessionGeneration prevents retained pointers from an old account from
+	// being used after the filesystem cache is replaced.
+	sessionGeneration uint64
+	name              string
+	hash              string
+	parent            *Node
+	children          []*Node
+	ntype             int
+	size              int64
+	ts                time.Time
+	meta              NodeMeta
 }
 
 func (n *Node) removeChild(c *Node) bool {
@@ -281,7 +397,7 @@ func (n *Node) addChild(c *Node) {
 }
 
 func (n *Node) getChildren() []*Node {
-	return n.children
+	return append([]*Node(nil), n.children...)
 }
 
 func (n *Node) GetType() int {
@@ -314,6 +430,22 @@ func (n *Node) GetHash() string {
 	return n.hash
 }
 
+// getHashContext snapshots a node handle without making context-aware callers
+// wait indefinitely for the filesystem mutex.
+func (n *Node) getHashContext(ctx context.Context) (string, error) {
+	if n == nil || n.fs == nil {
+		return "", EARGS
+	}
+	if err := lockMutexContext(ctx, &n.fs.mutex); err != nil {
+		return "", err
+	}
+	defer n.fs.mutex.Unlock()
+	if err := n.fs.validateNodeLocked(n); err != nil {
+		return "", err
+	}
+	return n.hash, nil
+}
+
 type NodeMeta struct {
 	key     []byte
 	compkey []byte
@@ -329,7 +461,25 @@ type MegaFS struct {
 	sroots []*Node
 	lookup map[string]*Node
 	skmap  map[string]string
-	mutex  sync.Mutex
+	// sessionGeneration is protected by mutex and matches the owning Mega's
+	// generation whenever the filesystem cache is visible.
+	sessionGeneration uint64
+	mutex             sync.Mutex
+}
+
+func (fs *MegaFS) validateNodeLocked(node *Node) error {
+	if node == nil {
+		return EARGS
+	}
+	if node.fs != fs || node.sessionGeneration != fs.sessionGeneration {
+		return errStaleNode
+	}
+	return nil
+}
+
+// validateNodeLocked checks ownership while the caller holds m.FS.mutex.
+func (m *Mega) validateNodeLocked(node *Node) error {
+	return m.FS.validateNodeLocked(node)
 }
 
 // Get filesystem root node
@@ -376,8 +526,8 @@ func (fs *MegaFS) GetChildren(n *Node) ([]*Node, error) {
 
 	var empty []*Node
 
-	if n == nil {
-		return empty, EARGS
+	if err := fs.validateNodeLocked(n); err != nil {
+		return empty, err
 	}
 
 	node := fs.hashLookup(n.hash)
@@ -395,8 +545,8 @@ func (fs *MegaFS) PathLookup(root *Node, ns []string) ([]*Node, error) {
 	fs.mutex.Lock()
 	defer fs.mutex.Unlock()
 
-	if root == nil {
-		return nil, EARGS
+	if err := fs.validateNodeLocked(root); err != nil {
+		return nil, err
 	}
 
 	var err error
@@ -432,7 +582,7 @@ func (fs *MegaFS) PathLookup(root *Node, ns []string) ([]*Node, error) {
 func (fs *MegaFS) GetSharedRoots() []*Node {
 	fs.mutex.Lock()
 	defer fs.mutex.Unlock()
-	return fs.sroots
+	return append([]*Node(nil), fs.sroots...)
 }
 
 func newMegaFS() *MegaFS {
@@ -474,11 +624,11 @@ func discardLogf(format string, v ...any) {
 
 // Returns an opaque string representing the session
 func (m *Mega) GetSessionID() string {
-	return m.sid
+	return m.snapshotSessionCredentials().sessionID
 }
 
 func (m *Mega) GetMasterKey() []byte {
-	return m.k
+	return m.snapshotSessionCredentials().masterKey
 }
 
 // "Login" using the session ID (for API auth) and master key (for decryption). Alternative to logging in with username/password
@@ -493,10 +643,75 @@ func (m *Mega) LoginWithKeysContext(ctx context.Context, sessionId string, maste
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = m.Close()
-	m.sid = sessionId
-	m.k = masterKey
+	if err := lockMutexContext(ctx, &m.sessionInitMu); err != nil {
+		return err
+	}
+	defer m.sessionInitMu.Unlock()
+	if err := m.installSessionContext(ctx, sessionCredentials{
+		sessionID: sessionId,
+		masterKey: append([]byte(nil), masterKey...),
+	}); err != nil {
+		return err
+	}
 	return m.postAuthInitContext(ctx)
+}
+
+// installSessionContext serializes session replacement with filesystem
+// refreshes. Lock order is filesystemRefreshMu -> eventMu -> FS.mutex; the old
+// poller is joined before sid/key/sequence are replaced, and all locks are
+// released before postAuthInitContext starts its filesystem request.
+func (m *Mega) installSessionContext(ctx context.Context, credentials sessionCredentials) error {
+	ctx = contextOrBackground(ctx)
+	if err := lockMutexContext(ctx, &m.filesystemRefreshMu); err != nil {
+		return err
+	}
+	defer m.filesystemRefreshMu.Unlock()
+
+	if err := lockMutexContext(ctx, &m.eventMu); err != nil {
+		return err
+	}
+	defer m.eventMu.Unlock()
+	pollerWasRunning := m.eventDone != nil || m.eventCancel != nil
+	m.stopEventPollerLocked()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		if pollerWasRunning {
+			m.startEventPollerLocked()
+		}
+		return err
+	}
+	installErr := func() error {
+		defer m.FS.mutex.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		m.sessionMu.Lock()
+		if m.sid != credentials.sessionID || !bytes.Equal(m.k, credentials.masterKey) {
+			m.sessionGeneration++
+			m.FS.sessionGeneration = m.sessionGeneration
+			m.FS.root = nil
+			m.FS.trash = nil
+			m.FS.inbox = nil
+			m.FS.sroots = nil
+			m.FS.lookup = make(map[string]*Node)
+			m.FS.skmap = make(map[string]string)
+		}
+		m.sid = credentials.sessionID
+		m.k = append([]byte(nil), credentials.masterKey...)
+		// The event sequence belongs to the replaced session. The new snapshot
+		// supplies the sequence before its replacement poller is started.
+		m.ssn = ""
+		if credentials.setAccountFields {
+			m.accountVersion = credentials.accountVersion
+			m.accountSalt = append([]byte(nil), credentials.accountSalt...)
+			m.uh = append([]byte(nil), credentials.userHandle...)
+		}
+		m.sessionMu.Unlock()
+		return nil
+	}()
+	if installErr != nil && pollerWasRunning {
+		m.startEventPollerLocked()
+	}
+	return installErr
 }
 
 // SetLogger sets the logger for important messages.  By default this
@@ -1047,6 +1262,9 @@ func apiFilesResponseError(raw json.RawMessage, fields map[string]json.RawMessag
 	if err := json.Unmarshal(rawNodes, &nodes); err != nil {
 		return EBADRESP
 	}
+	if len(nodes) == 0 {
+		return EBADRESP
+	}
 	for _, node := range nodes {
 		if err := apiFilesystemNodeError(node); err != nil {
 			return err
@@ -1200,6 +1418,12 @@ func (m *Mega) api_request_context(ctx context.Context, r []byte) ([]byte, error
 	return m.apiRequestWithHashCashContext(ctx, r, solveHashCashChallengeContext)
 }
 
+// api_request_context_with_session binds a request to credentials captured by
+// its caller before any queueing or account-keyed preparation.
+func (m *Mega) api_request_context_with_session(ctx context.Context, r []byte, session sessionCredentialsSnapshot) ([]byte, error) {
+	return m.apiRequestWithHashCashSessionContext(ctx, r, solveHashCashChallengeContext, session)
+}
+
 // apiRequestWithHashCash keeps the request path testable with a deterministic
 // solver while production uses solveHashCashChallenge through api_request.
 func (m *Mega) apiRequestWithHashCash(r []byte, solveHashCash func(string, int, time.Duration, int) (string, error)) (body []byte, retErr error) {
@@ -1209,6 +1433,14 @@ func (m *Mega) apiRequestWithHashCash(r []byte, solveHashCash func(string, int, 
 }
 
 func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solveHashCash func(context.Context, string, int, time.Duration, int) (string, error)) (body []byte, retErr error) {
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return m.apiRequestWithHashCashSessionContext(ctx, r, solveHashCash, session)
+}
+
+func (m *Mega) apiRequestWithHashCashSessionContext(ctx context.Context, r []byte, solveHashCash func(context.Context, string, int, time.Duration, int) (string, error), session sessionCredentialsSnapshot) (body []byte, retErr error) {
 	ctx = contextOrBackground(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1229,16 +1461,19 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 		m.sn++
 		release()
 	}()
+	if err := m.validateSessionContext(ctx, session); err != nil {
+		return nil, err
+	}
 
 	url := fmt.Sprintf("%s/cs?id=%d", m.baseurl, m.sn)
-	if m.sid != "" {
-		url = fmt.Sprintf("%s&sid=%s", url, m.sid)
+	if session.sessionID != "" {
+		url = fmt.Sprintf("%s&sid=%s", url, session.sessionID)
 	}
 	defer func() {
-		retErr = sanitizeAPIError(retErr, m.sid)
+		retErr = sanitizeAPIError(retErr, session.sessionID)
 	}()
 	uncertain := func(err error) error {
-		return uncertainOutcomeError(action, sanitizeAPIError(err, m.sid))
+		return uncertainOutcomeError(action, sanitizeAPIError(err, session.sessionID))
 	}
 
 	sleepTime := minSleepTime // initial backoff time
@@ -1252,8 +1487,11 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 			}
 			return nil, err
 		}
+		if err := m.validateSessionContext(ctx, session); err != nil {
+			return nil, err
+		}
 		if i != 0 {
-			m.debugf("Retry API request %d/%d: %v", i, attempts-1, sanitizeAPIError(lastErr, m.sid))
+			m.debugf("Retry API request %d/%d: %v", i, attempts-1, sanitizeAPIError(lastErr, session.sessionID))
 			if retryDelaySet {
 				if err := sleepContext(ctx, retryDelay); err != nil {
 					return nil, err
@@ -1279,7 +1517,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 			return nil, err
 		}
 		addRequestHeaders(req)
-		if err := ctx.Err(); err != nil {
+		if err := m.validateSessionContext(ctx, session); err != nil {
 			return nil, err
 		}
 
@@ -1307,7 +1545,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 		// non-read actions. Without established rejection semantics, an unusable
 		// challenge leaves a non-read request's outcome uncertain.
 		if resp.StatusCode == http.StatusPaymentRequired {
-			challengeErr := apiStatusError(resp, m.sid)
+			challengeErr := apiStatusError(resp, session.sessionID)
 			sleepTime = minSleepTime
 			easiness, token, valid := parseHashcash(resp.Header.Get("X-Hashcash"))
 			closeAPIResponse(resp)
@@ -1328,7 +1566,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 			}
 			if solveErr != nil || cashValue == "" {
 				if solveErr != nil {
-					m.debugf("Failed to solve hashcash challenge: %v", sanitizeAPIError(solveErr, m.sid))
+					m.debugf("Failed to solve hashcash challenge: %v", sanitizeAPIError(solveErr, session.sessionID))
 				} else {
 					m.debugf("Failed to solve hashcash challenge: empty cash value")
 				}
@@ -1339,7 +1577,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 					failureErr = errors.Join(challengeErr, errors.New("hashcash solver returned an empty solution"))
 				}
 				lastErr = failureErr
-				failureErr = sanitizeAPIError(failureErr, m.sid)
+				failureErr = sanitizeAPIError(failureErr, session.sessionID)
 				if !retryable {
 					return nil, uncertain(failureErr)
 				}
@@ -1351,7 +1589,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 				return nil, err
 			}
 			addHashCashRequestHeaders(req, token, cashValue)
-			if err := ctx.Err(); err != nil {
+			if err := m.validateSessionContext(ctx, session); err != nil {
 				return nil, err
 			}
 			resp, err = m.doAPIRequest(req, retryable)
@@ -1374,7 +1612,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 				return nil, lastErr
 			}
 			if resp.StatusCode == http.StatusPaymentRequired {
-				statusErr := apiStatusError(resp, m.sid)
+				statusErr := apiStatusError(resp, session.sessionID)
 				closeAPIResponse(resp)
 				if !retryable {
 					return nil, uncertain(statusErr)
@@ -1384,7 +1622,7 @@ func (m *Mega) apiRequestWithHashCashContext(ctx context.Context, r []byte, solv
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			statusErr := apiStatusError(resp, m.sid)
+			statusErr := apiStatusError(resp, session.sessionID)
 			closeAPIResponse(resp)
 			if !retryable {
 				return nil, uncertain(statusErr)
@@ -1462,6 +1700,16 @@ func (m *Mega) prelogin(email string) error {
 }
 
 func (m *Mega) preloginContext(ctx context.Context, email string) error {
+	version, salt, err := m.preloginCredentialsContext(ctx, email)
+	if err != nil {
+		return err
+	}
+	m.accountVersion = version
+	m.accountSalt = salt
+	return nil
+}
+
+func (m *Mega) preloginCredentialsContext(ctx context.Context, email string) (int, []byte, error) {
 	var msg [1]PreloginMsg
 	var res [1]PreloginResp
 
@@ -1472,34 +1720,33 @@ func (m *Mega) preloginContext(ctx context.Context, email string) error {
 
 	req, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	result, err := m.api_request_context(ctx, req)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	err = json.Unmarshal(result, &res)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	if res[0].Version == 0 {
-		return errors.New("prelogin: no version returned")
+		return 0, nil, errors.New("prelogin: no version returned")
 	} else if res[0].Version > 2 {
-		return fmt.Errorf("prelogin: version %d account not supported", res[0].Version)
+		return 0, nil, fmt.Errorf("prelogin: version %d account not supported", res[0].Version)
 	} else if res[0].Version == 2 {
 		if len(res[0].Salt) == 0 {
-			return errors.New("prelogin: no salt returned")
+			return 0, nil, errors.New("prelogin: no salt returned")
 		}
-		m.accountSalt, err = base64urldecode(res[0].Salt)
+		salt, err := base64urldecode(res[0].Salt)
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
+		return res[0].Version, salt, nil
 	}
-	m.accountVersion = res[0].Version
-
-	return nil
+	return res[0].Version, nil, nil
 }
 
 // Authenticate and start a session
@@ -1508,6 +1755,18 @@ func (m *Mega) login(email string, passwd string, multiFactor string) error {
 }
 
 func (m *Mega) loginContext(ctx context.Context, email string, passwd string, multiFactor string) error {
+	if err := lockMutexContext(ctx, &m.sessionInitMu); err != nil {
+		return err
+	}
+	defer m.sessionInitMu.Unlock()
+	credentials, err := m.loginCredentialsContext(ctx, email, passwd, multiFactor, m.accountVersion, append([]byte(nil), m.accountSalt...))
+	if err != nil {
+		return err
+	}
+	return m.installSessionContext(ctx, credentials)
+}
+
+func (m *Mega) loginCredentialsContext(ctx context.Context, email string, passwd string, multiFactor string, accountVersion int, accountSalt []byte) (sessionCredentials, error) {
 	var msg [1]LoginMsg
 	var res [1]LoginResp
 	var err error
@@ -1517,31 +1776,29 @@ func (m *Mega) loginContext(ctx context.Context, email string, passwd string, mu
 
 	passkey, err := password_key(passwd)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
 	uhandle, err := stringhash(email, passkey)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
-	m.uh = make([]byte, len(uhandle))
-	copy(m.uh, uhandle)
 
 	msg[0].Cmd = "us"
 	msg[0].User = email
 	msg[0].Mfa = multiFactor
 
-	if m.accountVersion == 1 {
+	if accountVersion == 1 {
 		msg[0].Handle = uhandle
 	} else {
 		const derivedKeyLength = 2 * aes.BlockSize
-		derivedKey := pbkdf2.Key([]byte(passwd), m.accountSalt, 100000, derivedKeyLength, sha512.New)
+		derivedKey := pbkdf2.Key([]byte(passwd), accountSalt, 100000, derivedKeyLength, sha512.New)
 		authKey := derivedKey[aes.BlockSize:]
 		passkey = derivedKey[:aes.BlockSize]
 
 		sessionKey := make([]byte, aes.BlockSize)
 		_, err = rand.Read(sessionKey)
 		if err != nil {
-			return err
+			return sessionCredentials{}, err
 		}
 		msg[0].Handle = base64urlencode(authKey)
 		msg[0].SessionKey = base64urlencode(sessionKey)
@@ -1549,32 +1806,39 @@ func (m *Mega) loginContext(ctx context.Context, email string, passwd string, mu
 
 	req, err := json.Marshal(msg)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
 	result, err = m.api_request_context(ctx, req)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
 
 	err = json.Unmarshal(result, &res)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
 
-	m.k, err = base64urldecode(res[0].Key)
+	masterKey, err := base64urldecode(res[0].Key)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
 	cipher, err := aes.NewCipher(passkey)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
-	cipher.Decrypt(m.k, m.k)
-	m.sid, err = decryptSessionId(res[0].Privk, res[0].Csid, m.k)
+	cipher.Decrypt(masterKey, masterKey)
+	sessionID, err := decryptSessionId(res[0].Privk, res[0].Csid, masterKey)
 	if err != nil {
-		return err
+		return sessionCredentials{}, err
 	}
-	return nil
+	return sessionCredentials{
+		sessionID:        sessionID,
+		masterKey:        masterKey,
+		accountVersion:   accountVersion,
+		accountSalt:      append([]byte(nil), accountSalt...),
+		userHandle:       append([]byte(nil), uhandle...),
+		setAccountFields: true,
+	}, nil
 }
 
 // Authenticate and start a session
@@ -1598,14 +1862,20 @@ func (m *Mega) MultiFactorLoginContext(ctx context.Context, email, passwd, multi
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = m.Close()
-	err := m.preloginContext(ctx, email)
+	if err := lockMutexContext(ctx, &m.sessionInitMu); err != nil {
+		return err
+	}
+	defer m.sessionInitMu.Unlock()
+
+	accountVersion, accountSalt, err := m.preloginCredentialsContext(ctx, email)
 	if err != nil {
 		return err
 	}
-
-	err = m.loginContext(ctx, email, passwd, multiFactor)
+	credentials, err := m.loginCredentialsContext(ctx, email, passwd, multiFactor, accountVersion, accountSalt)
 	if err != nil {
+		return err
+	}
+	if err := m.installSessionContext(ctx, credentials); err != nil {
 		return err
 	}
 
@@ -1617,19 +1887,23 @@ func (m *Mega) postAuthInit() error {
 	return m.postAuthInitContext(context.Background())
 }
 
-func (m *Mega) postAuthInitContext(ctx context.Context) error {
-
+func (m *Mega) postAuthInitContext(ctx context.Context) (retErr error) {
+	ctx = contextOrBackground(ctx)
 	waitEvent := m.WaitEventsStart()
+	defer func() {
+		if retErr != nil {
+			m.removeWaitEvent(waitEvent)
+			_ = m.Close()
+		}
+	}()
 
 	err := m.getFileSystemContext(ctx)
 	if err != nil {
-		m.removeWaitEvent(waitEvent)
 		return err
 	}
 
 	// Wait until the all the pending events have been received
 	if _, err := m.waitEventsContext(ctx, waitEvent, 5*time.Second); err != nil {
-		m.removeWaitEvent(waitEvent)
 		return err
 	}
 
@@ -1753,6 +2027,14 @@ func (m *Mega) GetQuotaContext(ctx context.Context) (QuotaResp, error) {
 
 // Add a node into filesystem
 func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
+	return m.addFSNodeWithMasterKey(itm, m.snapshotSessionCredentials().masterKey)
+}
+
+// addFSNodeWithMasterKey adds a node using a stable master-key snapshot. The
+// explicit key lets filesystem refresh preflight and replay the same response
+// against isolated and live caches without depending on a concurrent account
+// key change.
+func (m *Mega) addFSNodeWithMasterKey(itm FSNode, masterKey []byte) (*Node, error) {
 	var compkey, key []uint32
 	var attr FileAttr
 	var node, parent *Node
@@ -1764,7 +2046,7 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 		return nil, fmt.Errorf("filesystem node %q has unknown type %d", itm.Hash, itm.T)
 	}
 
-	master_aes, err := aes.NewCipher(m.k)
+	master_aes, err := aes.NewCipher(masterKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1883,14 +2165,17 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 		node = n
 	default:
 		node = &Node{
-			fs:    m.FS,
-			ntype: itm.T,
-			size:  itm.Sz,
-			ts:    time.Unix(itm.Ts, 0),
+			fs:                m.FS,
+			sessionGeneration: m.FS.sessionGeneration,
+			ntype:             itm.T,
+			size:              itm.Sz,
+			ts:                time.Unix(itm.Ts, 0),
 		}
 
 		m.FS.lookup[itm.Hash] = node
 	}
+	node.size = itm.Sz
+	node.ts = time.Unix(itm.Ts, 0)
 
 	n, ok = m.FS.lookup[itm.Parent]
 	switch {
@@ -1907,14 +2192,16 @@ func (m *Mega) addFSNode(itm FSNode) (*Node, error) {
 		parent = nil
 		if itm.Parent != "" {
 			parent = &Node{
-				fs:       m.FS,
-				children: []*Node{node},
-				ntype:    FOLDER,
+				fs:                m.FS,
+				sessionGeneration: m.FS.sessionGeneration,
+				children:          []*Node{node},
+				ntype:             FOLDER,
 			}
 			m.FS.lookup[itm.Parent] = parent
 		}
 	}
 
+	node.meta = NodeMeta{}
 	switch {
 	case itm.T == FILE:
 		var meta NodeMeta
@@ -1976,8 +2263,15 @@ func (m *Mega) getFileSystem() error {
 }
 
 func (m *Mega) getFileSystemContext(ctx context.Context) error {
-	m.FS.mutex.Lock()
-	defer m.FS.mutex.Unlock()
+	ctx = contextOrBackground(ctx)
+	if err := lockMutexContext(ctx, &m.filesystemRefreshMu); err != nil {
+		return err
+	}
+	defer m.filesystemRefreshMu.Unlock()
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return err
+	}
 
 	var msg [1]FilesMsg
 	var res [1]FilesResp
@@ -1989,7 +2283,7 @@ func (m *Mega) getFileSystemContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	result, err := m.api_request_context(ctx, req)
+	result, err := m.api_request_context_with_session(ctx, req, session)
 	if err != nil {
 		return err
 	}
@@ -1998,36 +2292,120 @@ func (m *Mega) getFileSystemContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	for _, sk := range res[0].Ok {
-		m.FS.skmap[sk.Hash] = sk.Key
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	for _, itm := range res[0].F {
-		_, err = m.addFSNode(itm)
-		if err != nil {
-			return fmt.Errorf("getFileSystem: invalid node %q: %w", itm.Hash, err)
+	// Stop and join the previous poller before changing filesystem/session
+	// state. A poller event handler may itself be waiting for FS.mutex, so the
+	// join must happen before acquiring that mutex.
+	if err := lockMutexContext(ctx, &m.eventMu); err != nil {
+		return err
+	}
+	defer m.eventMu.Unlock()
+	pollerWasRunning := m.eventDone != nil || m.eventCancel != nil
+	m.stopEventPollerLocked()
+
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		if pollerWasRunning {
+			m.startEventPollerLocked()
 		}
+		return err
 	}
 
-	m.ssn = res[0].Sn
+	applyResult := func() error {
+		defer m.FS.mutex.Unlock()
+		if m.FS.sessionGeneration != session.generation {
+			return errors.New("filesystem refresh belongs to a replaced session")
+		}
 
-	m.startEventPoller()
+		// Validate the entire snapshot against an isolated cache first. The live
+		// cache and sequence remain untouched if any node is malformed.
+		masterKey := append([]byte(nil), session.masterKey...)
+		stagedFS := newMegaFS()
+		for _, sk := range res[0].Ok {
+			stagedFS.skmap[sk.Hash] = sk.Key
+		}
+		stagedMega := &Mega{k: masterKey, FS: stagedFS}
+
+		for _, itm := range res[0].F {
+			if _, err := stagedMega.addFSNodeWithMasterKey(itm, masterKey); err != nil {
+				return fmt.Errorf("getFileSystem: invalid node %q: %w", itm.Hash, err)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// The f/c=1 request is this client's full-filesystem fetch. Rebuild its
+		// indexes from the validated response while reusing pointers for handles
+		// already present in this session.
+		retainedNodes := make(map[string]*Node, len(res[0].F))
+		for _, itm := range res[0].F {
+			if node := m.FS.lookup[itm.Hash]; node != nil {
+				retainedNodes[itm.Hash] = node
+			}
+		}
+		for _, node := range m.FS.lookup {
+			node.parent = nil
+			node.children = nil
+		}
+		m.FS.lookup = retainedNodes
+		m.FS.root = nil
+		m.FS.trash = nil
+		m.FS.inbox = nil
+		m.FS.sroots = nil
+
+		// Preflight and replay use the same stable key, initial share-key map,
+		// response keys, and node order while the live FS lock is held and the
+		// old poller is joined. addFSNodeWithMasterKey's only failure points
+		// have all been exercised by preflight; replay preserves retained Node
+		// pointers while dropping nodes omitted from this snapshot.
+		// The f/c=1 response is authoritative for this session. Do not retain
+		// share keys for folders omitted from the refreshed snapshot: stale keys
+		// could otherwise be used to interpret a later, unrelated shared node.
+		m.FS.skmap = make(map[string]string, len(res[0].Ok))
+		for _, sk := range res[0].Ok {
+			m.FS.skmap[sk.Hash] = sk.Key
+		}
+		for _, itm := range res[0].F {
+			if _, err := m.addFSNodeWithMasterKey(itm, masterKey); err != nil {
+				return fmt.Errorf("getFileSystem: validated node %q failed during commit: %w", itm.Hash, err)
+			}
+		}
+
+		m.ssn = res[0].Sn
+		return nil
+	}()
+	if applyResult != nil {
+		if pollerWasRunning {
+			m.startEventPollerLocked()
+		}
+		return applyResult
+	}
+
+	// FS.mutex has been released before starting the new poller. Starting here
+	// does not join: the previous poller was joined above, outside FS.mutex.
+	m.startEventPollerLocked()
 
 	return nil
 }
 
 // Download contains the internal state of a download
 type Download struct {
-	m           *Mega
-	src         *Node
-	resourceUrl string
-	aes_block   cipher.Block
-	iv          []byte
-	mac_enc     cipher.BlockMode
-	mutex       sync.Mutex // to protect the following
-	chunks      []chunkSize
-	chunk_macs  [][]byte
+	m            *Mega
+	src          *Node
+	resourceUrl  string
+	aes_block    cipher.Block
+	source_iv    []byte
+	source_mac   []byte
+	iv           []byte
+	mac_enc      cipher.BlockMode
+	mutex        sync.Mutex // to protect the following
+	chunks       []chunkSize
+	chunk_macs   [][]byte
+	session      sessionCredentialsSnapshot
+	sessionBound bool
 }
 
 // an all nil IV for mac calculations
@@ -2047,25 +2425,39 @@ func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, er
 	if src == nil {
 		return nil, EARGS
 	}
+	ctx = contextOrBackground(ctx)
 
 	var msg [1]DownloadMsg
 	var res [1]DownloadResp
 
-	m.FS.mutex.Lock()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return nil, err
+	}
+	if err := m.validateNodeLocked(src); err != nil {
+		m.FS.mutex.Unlock()
+		return nil, err
+	}
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		m.FS.mutex.Unlock()
+		return nil, err
+	}
 	msg[0].Cmd = "g"
 	msg[0].G = 1
 	msg[0].N = src.hash
 	if m.config.https {
 		msg[0].SSL = 2
 	}
-	key := src.meta.key
+	key := append([]byte(nil), src.meta.key...)
+	ivSnapshot := append([]byte(nil), src.meta.iv...)
+	macSnapshot := append([]byte(nil), src.meta.mac...)
 	m.FS.mutex.Unlock()
 
 	request, err := json.Marshal(msg)
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request_context(ctx, request)
+	result, err := m.api_request_context_with_session(ctx, request, session)
 	if err != nil {
 		return nil, err
 	}
@@ -2093,9 +2485,7 @@ func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, er
 	}
 
 	mac_enc := cipher.NewCBCEncrypter(aes_block, zero_iv)
-	m.FS.mutex.Lock()
-	t, err := bytes_to_a32(src.meta.iv)
-	m.FS.mutex.Unlock()
+	t, err := bytes_to_a32(ivSnapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -2110,16 +2500,42 @@ func (m *Mega) NewDownloadContext(ctx context.Context, src *Node) (*Download, er
 	}
 
 	d := &Download{
-		m:           m,
-		src:         src,
-		resourceUrl: downloadUrl,
-		aes_block:   aes_block,
-		iv:          iv,
-		mac_enc:     mac_enc,
-		chunks:      chunks,
-		chunk_macs:  make([][]byte, len(chunks)),
+		m:            m,
+		src:          src,
+		resourceUrl:  downloadUrl,
+		aes_block:    aes_block,
+		source_iv:    ivSnapshot,
+		source_mac:   macSnapshot,
+		iv:           iv,
+		mac_enc:      mac_enc,
+		chunks:       chunks,
+		chunk_macs:   make([][]byte, len(chunks)),
+		session:      session,
+		sessionBound: true,
 	}
 	return d, nil
+}
+
+func (d *Download) validateSessionContext(ctx context.Context) error {
+	if d == nil {
+		return EARGS
+	}
+	// Preserve compatibility for legacy callers and tests that construct a
+	// Download directly. Downloads created by NewDownloadContext are bound.
+	if !d.sessionBound {
+		return nil
+	}
+	if d.m == nil {
+		return EARGS
+	}
+	current, err := d.m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return err
+	}
+	if !sameSession(d.session, current) {
+		return errors.New("download belongs to a replaced session")
+	}
+	return nil
 }
 
 // Chunks returns The number of chunks in the download.
@@ -2149,6 +2565,9 @@ func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []by
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := d.validateSessionContext(ctx); err != nil {
+		return nil, err
+	}
 	if id < 0 || id >= len(d.chunks) {
 		return nil, EARGS
 	}
@@ -2156,6 +2575,14 @@ func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []by
 	chk_start, chk_size, err := d.ChunkLocation(id)
 	if err != nil {
 		return nil, err
+	}
+	sourceName := ""
+	if d.src != nil && d.src.fs != nil {
+		if err := lockMutexContext(ctx, &d.src.fs.mutex); err != nil {
+			return nil, err
+		}
+		sourceName = d.src.name
+		d.src.fs.mutex.Unlock()
 	}
 
 	var resp *http.Response
@@ -2186,7 +2613,7 @@ func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []by
 			return nil, ctx.Err()
 		}
 		err = sanitizeAPIError(err, chunk_url)
-		d.m.debugf("%s: Retry download chunk %d/%d: %v", d.src.name, retry, d.m.retries, err)
+		d.m.debugf("%s: Retry download chunk %d/%d: %v", sourceName, retry, d.m.retries, err)
 		if retry+1 < d.m.retries+1 {
 			if err := sleepContext(ctx, sleepTime); err != nil {
 				return nil, err
@@ -2222,7 +2649,7 @@ func (d *Download) DownloadChunkContext(ctx context.Context, id int) (chunk []by
 	}
 
 	// Decrypt the block
-	ctr_iv, err := bytes_to_a32(d.src.meta.iv)
+	ctr_iv, err := bytes_to_a32(d.source_iv)
 	if err != nil {
 		return nil, err
 	}
@@ -2268,6 +2695,9 @@ func (d *Download) FinishContext(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := d.validateSessionContext(ctx); err != nil {
+		return err
+	}
 	// Can't check a 0 sized file
 	if len(d.chunk_macs) == 0 {
 		return nil
@@ -2300,7 +2730,7 @@ func (d *Download) FinishContext(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(btmac, d.src.meta.mac) {
+	if !bytes.Equal(btmac, d.source_mac) {
 		return EMACMISMATCH
 	}
 
@@ -2521,10 +2951,22 @@ type Upload struct {
 	kbytes            []byte
 	ukey              []uint32
 	mutex             sync.Mutex // to protect the following
+	finishState       uploadFinishState
+	inFlightChunks    int
 	chunks            []chunkSize
 	chunk_macs        [][]byte
 	completion_handle []byte
+	session           sessionCredentialsSnapshot
+	sessionBound      bool
 }
+
+type uploadFinishState uint8
+
+const (
+	uploadFinishIdle uploadFinishState = iota
+	uploadFinishRunning
+	uploadFinishAttempted
+)
 
 // Create a new Upload of name into parent of fileSize
 //
@@ -2540,10 +2982,27 @@ func (m *Mega) NewUploadContext(ctx context.Context, parent *Node, name string, 
 	if parent == nil {
 		return nil, EARGS
 	}
+	ctx = contextOrBackground(ctx)
+	if err := lockMutexContext(ctx, &m.filesystemRefreshMu); err != nil {
+		return nil, err
+	}
+	defer m.filesystemRefreshMu.Unlock()
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	var msg [1]UploadMsg
 	var res [1]UploadResp
-	parenthash := parent.GetHash()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return nil, err
+	}
+	if err := m.validateNodeLocked(parent); err != nil {
+		m.FS.mutex.Unlock()
+		return nil, err
+	}
+	parenthash := parent.hash
+	m.FS.mutex.Unlock()
 
 	msg[0].Cmd = "u"
 	msg[0].S = fileSize
@@ -2555,7 +3014,7 @@ func (m *Mega) NewUploadContext(ctx context.Context, parent *Node, name string, 
 	if err != nil {
 		return nil, err
 	}
-	result, err := m.api_request_context(ctx, request)
+	result, err := m.api_request_context_with_session(ctx, request, session)
 	if err != nil {
 		return nil, err
 	}
@@ -2617,6 +3076,8 @@ func (m *Mega) NewUploadContext(ctx context.Context, parent *Node, name string, 
 		chunks:            chunks,
 		chunk_macs:        make([][]byte, len(chunks)),
 		completion_handle: []byte{},
+		session:           session,
+		sessionBound:      true,
 	}
 	return u, nil
 }
@@ -2645,6 +3106,30 @@ func (u *Upload) UploadChunkContext(ctx context.Context, id int, chunk []byte) (
 	ctx = contextOrBackground(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if u == nil || u.m == nil {
+		return EARGS
+	}
+	u.mutex.Lock()
+	if u.finishState != uploadFinishIdle {
+		u.mutex.Unlock()
+		return errors.New("upload finalization has already started")
+	}
+	u.inFlightChunks++
+	u.mutex.Unlock()
+	defer func() {
+		u.mutex.Lock()
+		u.inFlightChunks--
+		u.mutex.Unlock()
+	}()
+	if u.sessionBound {
+		currentSession, err := u.m.snapshotSessionCredentialsContext(ctx)
+		if err != nil {
+			return err
+		}
+		if !sameSession(u.session, currentSession) {
+			return errors.New("upload belongs to a replaced session")
+		}
 	}
 	chk_start, chk_size, err := u.ChunkLocation(id)
 	if err != nil {
@@ -2692,7 +3177,16 @@ func (u *Upload) UploadChunkContext(ctx context.Context, id int, chunk []byte) (
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	rsp, err = u.m.client.Do(req)
+	// Upload chunk POSTs are not safe to replay on redirects (notably 307/308).
+	// Use a request-scoped client so the shared client's redirect policy is not
+	// mutated and the original client remains safe for concurrent operations.
+	chunkClient := &http.Client{
+		Transport:     u.m.client.Transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Jar:           u.m.client.Jar,
+		Timeout:       u.m.client.Timeout,
+	}
+	rsp, err = chunkClient.Do(req)
 	if err != nil {
 		closeAPIResponse(rsp)
 		return uncertainOutcomeError("upload chunk", sanitizeAPIError(err, chk_url))
@@ -2709,6 +3203,7 @@ func (u *Upload) UploadChunkContext(ctx context.Context, id int, chunk []byte) (
 		return uncertainOutcomeError("upload chunk", errors.New("HTTP response body is nil"))
 	}
 	if ctx.Err() != nil {
+		_ = rsp.Body.Close()
 		return uncertainOutcomeError("upload chunk", ctx.Err())
 	}
 
@@ -2751,9 +3246,53 @@ func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if u == nil || u.m == nil {
+		return nil, EARGS
+	}
+	if err := lockMutexContext(ctx, &u.m.filesystemRefreshMu); err != nil {
+		return nil, err
+	}
+	defer u.m.filesystemRefreshMu.Unlock()
+	session, err := u.m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if u.sessionBound && !sameSession(u.session, session) {
+		return nil, errors.New("upload belongs to a replaced session")
+	}
+	u.mutex.Lock()
+	if u.finishState != uploadFinishIdle {
+		u.mutex.Unlock()
+		return nil, errors.New("upload finalization has already been attempted")
+	}
+	if u.inFlightChunks != 0 {
+		u.mutex.Unlock()
+		return nil, errors.New("upload chunks are still in flight")
+	}
+	u.finishState = uploadFinishRunning
+	completionHandle := append([]byte(nil), u.completion_handle...)
+	chunkMACs := make([][]byte, len(u.chunk_macs))
+	for i, chunkMAC := range u.chunk_macs {
+		chunkMACs[i] = append([]byte(nil), chunkMAC...)
+	}
+	u.mutex.Unlock()
+
+	finalizeAttempted := false
+	defer func() {
+		u.mutex.Lock()
+		if finalizeAttempted {
+			u.finishState = uploadFinishAttempted
+		} else if u.finishState == uploadFinishRunning {
+			u.finishState = uploadFinishIdle
+		}
+		u.mutex.Unlock()
+	}()
+	if len(completionHandle) == 0 {
+		return nil, errors.New("upload completion handle is missing")
+	}
 	mac_data := make([]byte, 16)
 	var macEnc cipher.BlockMode
-	for _, v := range u.chunk_macs {
+	for _, v := range chunkMACs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -2790,7 +3329,7 @@ func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	master_aes, err := aes.NewCipher(u.m.k)
+	master_aes, err := aes.NewCipher(session.masterKey)
 	if err != nil {
 		return nil, err
 	}
@@ -2804,7 +3343,7 @@ func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
 
 	cmsg[0].Cmd = "p"
 	cmsg[0].T = u.parenthash
-	cmsg[0].N[0].H = string(u.completion_handle)
+	cmsg[0].N[0].H = string(completionHandle)
 	cmsg[0].N[0].T = FILE
 	cmsg[0].N[0].A = attr_data
 	cmsg[0].N[0].K = base64urlencode(buf)
@@ -2813,7 +3352,14 @@ func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	result, err := u.m.api_request_context(ctx, request)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	u.mutex.Lock()
+	u.finishState = uploadFinishAttempted
+	u.mutex.Unlock()
+	finalizeAttempted = true
+	result, err := u.m.api_request_context_with_session(ctx, request, session)
 	if err != nil {
 		return nil, err
 	}
@@ -2826,9 +3372,13 @@ func (u *Upload) FinishContext(ctx context.Context) (node *Node, err error) {
 		return nil, uncertainOutcomeError("p", EBADRESP)
 	}
 
+	// The server has confirmed this mutation. Once its response is validated,
+	// finish the local cache commit even if ctx is canceled while waiting for
+	// FS.mutex; returning an uncertain outcome here would misreport a known
+	// remote success and leave the local filesystem stale.
 	u.m.FS.mutex.Lock()
 	defer u.m.FS.mutex.Unlock()
-	node, err = u.m.addFSNode(cres[0].F[0])
+	node, err = u.m.addFSNodeWithMasterKey(cres[0].F[0], session.masterKey)
 	if err != nil {
 		return nil, uncertainOutcomeError("p", err)
 	}
@@ -2983,11 +3533,22 @@ func (m *Mega) Move(src *Node, parent *Node) error {
 
 // MoveContext moves a node using ctx for the API request.
 func (m *Mega) MoveContext(ctx context.Context, src *Node, parent *Node) error {
-	m.FS.mutex.Lock()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return err
+	}
 	defer m.FS.mutex.Unlock()
+	return m.moveLocked(ctx, src, parent)
+}
 
-	if src == nil || parent == nil {
-		return EARGS
+// moveLocked performs both the remote move and local reparenting while the
+// caller holds FS.mutex. This lets DeleteContext snapshot the trash node and
+// move atomically without recursively acquiring the filesystem lock.
+func (m *Mega) moveLocked(ctx context.Context, src *Node, parent *Node) error {
+	if err := m.validateNodeLocked(src); err != nil {
+		return err
+	}
+	if err := m.validateNodeLocked(parent); err != nil {
+		return err
 	}
 	var msg [1]MoveFileMsg
 	var err error
@@ -3026,15 +3587,22 @@ func (m *Mega) Rename(src *Node, name string) error {
 
 // RenameContext renames a node using ctx for the API request.
 func (m *Mega) RenameContext(ctx context.Context, src *Node, name string) error {
-	m.FS.mutex.Lock()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return err
+	}
 	defer m.FS.mutex.Unlock()
 
-	if src == nil {
-		return EARGS
+	if err := m.validateNodeLocked(src); err != nil {
+		return err
 	}
 	var msg [1]FileAttrMsg
 
-	master_aes, err := aes.NewCipher(m.k)
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return err
+	}
+	masterKey := session.masterKey
+	master_aes, err := aes.NewCipher(masterKey)
 	if err != nil {
 		return err
 	}
@@ -3079,11 +3647,13 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 
 // CreateDirContext creates a directory using ctx for the API request.
 func (m *Mega) CreateDirContext(ctx context.Context, name string, parent *Node) (*Node, error) {
-	m.FS.mutex.Lock()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return nil, err
+	}
 	defer m.FS.mutex.Unlock()
 
-	if parent == nil {
-		return nil, EARGS
+	if err := m.validateNodeLocked(parent); err != nil {
+		return nil, err
 	}
 	var msg [1]UploadCompleteMsg
 	var res [1]UploadCompleteResp
@@ -3093,7 +3663,12 @@ func (m *Mega) CreateDirContext(ctx context.Context, name string, parent *Node) 
 		compkey[i] = uint32(mrand.Int31())
 	}
 
-	master_aes, err := aes.NewCipher(m.k)
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	masterKey := session.masterKey
+	master_aes, err := aes.NewCipher(masterKey)
 	if err != nil {
 		return nil, err
 	}
@@ -3157,15 +3732,28 @@ func (m *Mega) Delete(node *Node, destroy bool) error {
 
 // DeleteContext deletes or trashes a node using ctx for its API request.
 func (m *Mega) DeleteContext(ctx context.Context, node *Node, destroy bool) error {
-	if node == nil {
-		return EARGS
-	}
 	if !destroy {
-		return m.MoveContext(ctx, node, m.FS.trash)
+		if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+			return err
+		}
+		defer m.FS.mutex.Unlock()
+		if err := m.validateNodeLocked(node); err != nil {
+			return err
+		}
+		trash := m.FS.trash
+		if err := m.validateNodeLocked(trash); err != nil {
+			return err
+		}
+		return m.moveLocked(ctx, node, trash)
 	}
 
-	m.FS.mutex.Lock()
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return err
+	}
 	defer m.FS.mutex.Unlock()
+	if err := m.validateNodeLocked(node); err != nil {
+		return err
+	}
 
 	var msg [1]FileDeleteMsg
 	var err error
@@ -3272,8 +3860,12 @@ func (m *Mega) pollEvents(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		session, snapshotErr := m.snapshotSessionCredentialsContext(ctx)
+		if snapshotErr != nil {
+			return
+		}
 		if err != nil {
-			m.debugf("pollEvents: error from server: %v", sanitizeAPIError(err, m.sid))
+			m.debugf("pollEvents: error from server: %v", sanitizeAPIError(err, session.sessionID))
 			if sleepContext(ctx, sleepTime) != nil {
 				return
 			}
@@ -3283,7 +3875,7 @@ func (m *Mega) pollEvents(ctx context.Context) {
 			sleepTime = minSleepTime
 		}
 
-		url := fmt.Sprintf("%s/sc?sn=%s&sid=%s", m.baseurl, m.ssn, m.sid)
+		url := fmt.Sprintf("%s/sc?sn=%s&sid=%s", m.baseurl, m.ssn, session.sessionID)
 		var req *http.Request
 		req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 		if err == nil {
@@ -3294,7 +3886,7 @@ func (m *Mega) pollEvents(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			m.logf("pollEvents: Error fetching status: %s", sanitizeAPIError(err, m.sid))
+			m.logf("pollEvents: Error fetching status: %s", sanitizeAPIError(err, session.sessionID))
 			continue
 		}
 		if resp == nil {
@@ -3439,17 +4031,35 @@ func (m *Mega) getLink(n *Node) (string, error) {
 }
 
 func (m *Mega) getLinkContext(ctx context.Context, n *Node) (string, error) {
+	ctx = contextOrBackground(ctx)
+	if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+		return "", err
+	}
+	if err := m.validateNodeLocked(n); err != nil {
+		m.FS.mutex.Unlock()
+		return "", err
+	}
+	hash := n.hash
+	session, err := m.snapshotSessionCredentialsContext(ctx)
+	m.FS.mutex.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return m.getLinkByHashContext(ctx, hash, session)
+}
+
+func (m *Mega) getLinkByHashContext(ctx context.Context, hash string, session sessionCredentialsSnapshot) (string, error) {
 	var msg [1]GetLinkMsg
 	var res [1]string
 
 	msg[0].Cmd = "l"
-	msg[0].N = n.GetHash()
+	msg[0].N = hash
 
 	req, err := json.Marshal(msg)
 	if err != nil {
 		return "", err
 	}
-	result, err := m.api_request_context(ctx, req)
+	result, err := m.api_request_context_with_session(ctx, req, session)
 	if err != nil {
 		return "", err
 	}
@@ -3467,14 +4077,22 @@ func (m *Mega) Link(n *Node, includeKey bool) (string, error) {
 
 // LinkContext exports a node link using ctx for the API request.
 func (m *Mega) LinkContext(ctx context.Context, n *Node, includeKey bool) (string, error) {
+	ctx = contextOrBackground(ctx)
 	id, err := m.getLinkContext(ctx, n)
 	if err != nil {
 		return "", err
 	}
 	if includeKey {
-		m.FS.mutex.Lock()
-		key := base64urlencode(n.meta.compkey)
+		if err := lockMutexContext(ctx, &m.FS.mutex); err != nil {
+			return "", err
+		}
+		if err := m.validateNodeLocked(n); err != nil {
+			m.FS.mutex.Unlock()
+			return "", err
+		}
+		keyBytes := append([]byte(nil), n.meta.compkey...)
 		m.FS.mutex.Unlock()
+		key := base64urlencode(keyBytes)
 		return fmt.Sprintf("%v/#!%v!%v", BASE_DOWNLOAD_URL, id, key), nil
 	} else {
 		return fmt.Sprintf("%v/#!%v", BASE_DOWNLOAD_URL, id), nil
@@ -3506,3 +4124,4 @@ func getAPIBaseURL() string {
 	}
 	return url
 }
+
